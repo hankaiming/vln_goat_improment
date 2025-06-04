@@ -420,13 +420,13 @@ def train(args, train_env, val_envs, aug_env=None, rank=-1, tok=None, speaker_to
     
     # Load intervention features
     if args.z_instr_update:
-        z_dicts, landmark_dict, landmark_pz_dict = listner.update_z_dict(train_instr_data,z_dicts,z_dict=z_dicts)
+        z_dicts, landmark_dict, landmark_pz_dict = listner.update_z_dict(train_instr_data,z_dict=z_dicts)
     
     if args.do_front_img or args.do_front_his or args.do_front_txt:
         if len(args.frontdoor_dict_file) > 0: # load specific file
             z_front_dict =  front_feat_loader.read_tim_tsv(args.frontdoor_dict_file, return_dict=True)
         else: # random sample
-            z_front_dict = front_feat_loader.random_pick_front_features(args, iter=0, save_file=True)
+            z_front_dict = front_feat_loader.random_pick_front_features()
     else:
         z_front_dict = None
 
@@ -587,7 +587,7 @@ def train(args, train_env, val_envs, aug_env=None, rank=-1, tok=None, speaker_to
                             
                         if args.do_front_img or args.do_front_his or args.do_front_txt:
                             front_feat_loader.save_features(args, z_front_dict)
-                            z_front_dict = front_feat_loader.random_pick_front_features(args, iter, save_file=True)
+                            z_front_dict = front_feat_loader.random_pick_front_features()
         
         if args.z_instr_update and iter%(args.update_iter)==0 and (not is_update):
             if args.do_back_txt:

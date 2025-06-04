@@ -75,5 +75,5 @@ flag="--root_dir ${DATA_ROOT}
       "
 
 # train
-CUDA_VISIBLE_DEVICES='0' python -u reverie/main_nav_obj.py $flag  \
+CUDA_VISIBLE_DEVICES='2' python -u reverie/main_nav_obj.py $flag  \
       --resume_file ${resume_file}
