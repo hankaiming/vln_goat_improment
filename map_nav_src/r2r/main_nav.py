@@ -17,7 +17,7 @@ from utils.misc import set_random_seed
 from utils.logger import write_to_record_file, print_progress, timeSince
 from utils.distributed import init_distributed, is_default_gpu
 from utils.distributed import all_gather, merge_dist_results
-
+from utils.data import VGGTFeaturesDB
 from utils.data import ImageFeaturesDB, Tokenizer, KMeansPicker
 from r2r.transpeaker import Speaker
 from r2r.data_utils import construct_instrs
@@ -64,6 +64,14 @@ def build_dataset(args, rank=0):
 
     # Load features
     feat_db = ImageFeaturesDB(args.img_ft_file, args.image_feat_size)
+
+    vggt_db = None
+    vggt_path = "/workspace/VLN-DUET/data/vggt_features_REGIERS.h5"  # 你的路径
+    if os.path.exists(vggt_path):
+        print(f"Loading VGGT features from {vggt_path}...")
+        vggt_db = VGGTFeaturesDB(vggt_path)
+    else:
+        print(f"Warning: VGGT file not found at {vggt_path}")
     
     # Use augmented features
     if args.use_aug_env:

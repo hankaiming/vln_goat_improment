@@ -47,5 +47,5 @@ flag="--root_dir ${DATA_ROOT}
       "
 
 # train
-CUDA_VISIBLE_DEVICES='0' python r2r/main_nav.py $flag  \
+CUDA_VISIBLE_DEVICES='1' python r2r/main_nav.py $flag  \
       --bert_ckpt_file ${rxr_pretrain_file}

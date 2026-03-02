@@ -180,6 +180,7 @@ class GMapObjectNavAgent(Seq2SeqAgent):
     def _panorama_feature_variable_do(self, obs, img_zdict=None, noise=None, use_objname=True):
         ''' Extract precomputed features into variable. '''
         batch_view_img_fts, batch_obj_img_fts, batch_loc_fts, batch_nav_types = [], [], [], []
+        batch_view_vggt_fts = [] # [新增] 用于存储 batch 的 VGGT 特征
         batch_reverie_obj_loc_fts = []
         batch_reverie_obj_names = []
         batch_reverie_nav_types = []
@@ -192,7 +193,12 @@ class GMapObjectNavAgent(Seq2SeqAgent):
         
         for i, ob in enumerate(obs):
             view_img_fts, view_ang_fts, nav_types, cand_vpids = [], [], [], []
+            view_vggt_fts = [] # [新增] 当前 ob 的 VGGT 特征列表
             reverie_nav_types = []
+            
+            # 从 observation 中获取 vggt
+            vggt_source = ob.get('view_vggt_fts', None)
+
             # cand views
             used_viewidxs = set()
             for j, cc in enumerate(ob['candidate']):
@@ -201,9 +207,15 @@ class GMapObjectNavAgent(Seq2SeqAgent):
                 else:
                     view_img_fts.append(cc['feature'][:self.args.image_feat_size]*noise)
                 view_ang_fts.append(cc['feature'][self.args.image_feat_size:])
+                
+                # [新增] 添加 candidate 对应的 VGGT 特征
+                if vggt_source is not None:
+                    view_vggt_fts.append(vggt_source[cc['pointId']])
+
                 nav_types.append(1)
                 cand_vpids.append(cc['viewpointId'])
                 used_viewidxs.add(cc['pointId'])
+            
             # non cand views
             if noise is None:
                 view_img_fts.extend([x[:self.args.image_feat_size] for k, x \
@@ -211,16 +223,29 @@ class GMapObjectNavAgent(Seq2SeqAgent):
             else:
                 view_img_fts.extend([x[:self.args.image_feat_size]*noise for k, x \
                     in enumerate(ob['feature']) if k not in used_viewidxs])
+            
             view_ang_fts.extend([x[self.args.image_feat_size:] for k, x \
                 in enumerate(ob['feature']) if k not in used_viewidxs])
+            
+            # [新增] 添加 non-candidate 对应的 VGGT 特征
+            if vggt_source is not None:
+                view_vggt_fts.extend([vggt_source[k] for k in range(36) if k not in used_viewidxs])
 
             nav_types.extend([0] * (36 - len(used_viewidxs)))
             reverie_nav_types.extend([0]*36)
+            
             # combine cand views and noncand views
             view_img_fts = np.stack(view_img_fts, 0)    # (n_views, dim_ft)
             view_ang_fts = np.stack(view_ang_fts, 0)
             view_box_fts = np.array([[1, 1, 1]] * len(view_img_fts)).astype(np.float32)
             view_loc_fts = np.concatenate([view_ang_fts, view_box_fts], 1)
+            
+            # [新增] 堆叠 VGGT 特征
+            if vggt_source is not None:
+                view_vggt_fts = np.stack(view_vggt_fts, 0) # (36, 1024)
+                batch_view_vggt_fts.append(torch.from_numpy(view_vggt_fts))
+            else:
+                batch_view_vggt_fts.append(None)
 
             # object
             obj_loc_fts = np.concatenate([ob['obj_ang_fts'], ob['obj_box_fts']], 1)
@@ -253,6 +278,12 @@ class GMapObjectNavAgent(Seq2SeqAgent):
             batch_reverie_obj_names = pad_tensors(batch_reverie_obj_names).cuda()
         batch_reverie_nav_types = pad_sequence(batch_reverie_nav_types, batch_first=True, padding_value=0).cuda()
         
+        # [新增] Pad VGGT features
+        if len(batch_view_vggt_fts) > 0 and batch_view_vggt_fts[0] is not None:
+            batch_view_vggt_fts = pad_tensors(batch_view_vggt_fts).cuda()
+        else:
+            batch_view_vggt_fts = None
+
         if img_zdict is not None:
             z_img_features = img_zdict['img_features'].repeat(batch_size,1).reshape(batch_size,-1,768)
             z_img_pzs = img_zdict['img_pzs'].repeat(batch_size,1).reshape(batch_size,-1,1)
@@ -260,6 +291,7 @@ class GMapObjectNavAgent(Seq2SeqAgent):
         already_dropout = False if noise is None else True
         return {
             'view_img_fts': batch_view_img_fts, 
+            'view_vggt_fts': batch_view_vggt_fts, # [新增] 返回 VGGT batch
             'loc_fts': batch_loc_fts, 'nav_types': batch_nav_types,
             'view_lens': batch_view_lens, 
             'cand_vpids': batch_cand_vpids, 'obj_ids': batch_objids,
@@ -509,6 +541,12 @@ class GMapObjectNavAgent(Seq2SeqAgent):
         else:
             batch['traj_reverie_loc_fts'] = None
 
+        # [新增] batch VGGT
+        if 'traj_view_vggt_fts' in batch and batch['traj_view_vggt_fts'][0] is not None:
+             batch['traj_view_vggt_fts'] = pad_tensors(sum(batch['traj_view_vggt_fts'], []))
+        else:
+             batch['traj_view_vggt_fts'] = None
+
         # gmap batches: gmap_vpids
         batch['gmap_lens'] = torch.LongTensor([len(x) for x in batch['gmap_step_ids']]) # included [stop]
         batch['gmap_step_ids'] = pad_sequence(batch['gmap_step_ids'], batch_first=True, padding_value=0)
@@ -687,7 +725,7 @@ class GMapObjectNavAgent(Seq2SeqAgent):
                         'og': i_objids[torch.argmax(i_obj_logits)] if len(i_objids) > 0 else None,
                         'og_details': {'objids': i_objids, 'logits': i_obj_logits[:len(i_objids)]},
                     }
-                                        
+                                            
             if train_ml is not None:
                 # Supervised training
                 nav_targets = self._teacher_action(
@@ -705,7 +743,7 @@ class GMapObjectNavAgent(Seq2SeqAgent):
                 # objec grounding 
                 obj_targets = self._teacher_object(obs, ended, pano_inputs['view_lens'])
                 og_loss += self.criterion(obj_logits, obj_targets)
-                                                   
+                                                    
             # Determinate the next navigation viewpoint
             if self.feedback == 'teacher':
                 a_t = nav_targets                 # teacher forcing
@@ -820,18 +858,31 @@ class GMapObjectNavAgent(Seq2SeqAgent):
         
         traj_view_img_fts, traj_loc_fts, traj_nav_types, traj_cand_vpids = [], [], [], []
         traj_obj_img_fts, traj_reverie_loc_fts = [], []
+        traj_view_vggt_fts = [] # [新增] 用于存储 VGGT 轨迹特征
 
         for vp in gt_path:               
             view_fts = self.env.env.feat_db.get_image_feature(scan, vp)
             obj_img_fts, obj_attrs = self.env.obj_db.load_feature(scan, vp, max_objects=self.env.max_objects)
+            
+            # [新增] 读取 VGGT 特征
+            vggt_fts = None
+            if self.env.env.vggt_db is not None:
+                vggt_fts = self.env.env.vggt_db.get_image_feature(scan, vp)
 
             view_img_fts, view_angles, cand_vpids = [], [], []
+            view_vggt_fts = [] # [新增]
+
             # cand views
             nav_cands = self.env.scanvp_cands['%s_%s'%(scan, vp)]
             used_viewidxs = set()
             for k, v in nav_cands.items():
                 used_viewidxs.add(v[0])
                 view_img_fts.append(view_fts[v[0]])
+                
+                # [新增] 收集 candidate VGGT
+                if vggt_fts is not None:
+                    view_vggt_fts.append(vggt_fts[v[0]])
+
                 view_angle = self.env.all_point_rel_angles[12][v[0]]
                 heading = cur_heading - view_angle[0] + v[2]
                 elevation = cur_elevation - view_angle[1] + v[3]
@@ -841,6 +892,10 @@ class GMapObjectNavAgent(Seq2SeqAgent):
             view_img_fts.extend([view_fts[idx] for idx in range(36) if idx not in used_viewidxs])
             view_angles.extend([self.env.all_point_rel_angles[12][idx] for idx in range(36) if idx not in used_viewidxs])
             
+            # [新增] 收集 non-candidate VGGT
+            if vggt_fts is not None:
+                view_vggt_fts.extend([vggt_fts[idx] for idx in range(36) if idx not in used_viewidxs])
+
             # object features
             num_objs = obj_img_fts.shape[0]
             obj_angles = np.zeros((num_objs, 2), dtype=np.float32)
@@ -860,6 +915,11 @@ class GMapObjectNavAgent(Seq2SeqAgent):
             view_loc_fts = np.concatenate([view_ang_fts, view_box_fts], 1)
             obj_loc_fts = np.concatenate([obj_ang_fts, obj_box_fts], 1)
             
+            # [新增] 堆叠 VGGT
+            if vggt_fts is not None:
+                view_vggt_fts = np.stack(view_vggt_fts, 0)
+                traj_view_vggt_fts.append(view_vggt_fts)
+
             # combine pano features
             traj_view_img_fts.append(view_img_fts)
             traj_nav_types.append([1] * len(cand_vpids) + [0] * (36 - len(used_viewidxs)) + [2] * len(obj_img_fts))
@@ -886,6 +946,7 @@ class GMapObjectNavAgent(Seq2SeqAgent):
             'txt_ids': torch.LongTensor(item['instr_encoding'][:self.args.max_instr_len]),
             
             'traj_view_img_fts': [torch.from_numpy(x[:, :self.args.image_feat_size]) for x in traj_view_img_fts],
+            'traj_view_vggt_fts': [torch.from_numpy(x) for x in traj_view_vggt_fts] if len(traj_view_vggt_fts) > 0 else None, # [新增]
             'traj_loc_fts': [torch.from_numpy(x) for x in traj_loc_fts],
             'traj_reverie_loc_fts': [torch.from_numpy(x) for x in traj_reverie_loc_fts],
             'traj_obj_img_fts': [torch.from_numpy(x) for x in traj_obj_img_fts],

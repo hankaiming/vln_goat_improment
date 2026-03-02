@@ -3,11 +3,11 @@ import time
 from collections import defaultdict
 from easydict import EasyDict
 from tqdm import tqdm
-
+import h5py # [确认] 必须导入 h5py
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
-
+from data.dataset import read_img_features_from_tsv # 确保引入了这个函数
 import torch.cuda.amp as amp  
 
 from transformers import AutoTokenizer, PretrainedConfig
@@ -97,6 +97,19 @@ def main(opts):
         LOGGER.disabled = True
         pbar = NoOp()
         model_saver = NoOp()
+
+
+    vggt_h5_path = "/workspace/VLN-DUET/data/vggt_features_REGIERS.h5" 
+
+    LOGGER.info(f"Loading VGGT features from {vggt_h5_path} ...")
+    vggt_ft_db = None
+    if os.path.exists(vggt_h5_path):
+        # 使用项目自带的 H5PY 读取函数将特征读入内存字典
+        # 第二个参数 2048 是 VGGT 的特征维度
+        # 返回的 vggt_ft_db 是一个字典: {'scanId_viewpointId': numpy_array(36, 2048)}
+        vggt_ft_db = read_img_features_from_h5py(vggt_h5_path, 2048)
+    else:
+        LOGGER.warning(f"VGGT file not found at {vggt_h5_path}! Training will proceed with ZERO features.")
 
     # Model config
     model_config = PretrainedConfig.from_json_file(opts.model_config)
@@ -208,7 +221,9 @@ def main(opts):
     cat_mapping, category_number = read_category_file(data_cfg.cat_file)
     obj_ft_db = read_reverie_obj_features(data_cfg.obj_ft_file, opts.max_objects, model_config.obj_feat_size, model_config.obj_prob_size,cat_mapping,category_number)
     aug_img_db = read_img_features_from_h5py(data_cfg.aug_img_file, model_config.image_feat_size)
+    
     # load data training set
+    # ================= [修改] 传递 vggt_ft_db =================
     train_nav_db = ReverieTextPathData(
         data_cfg.train_traj_files, img_ft_db, obj_ft_db,
         data_cfg.scanvp_cands_file, data_cfg.connectivity_dir,
@@ -220,7 +235,8 @@ def main(opts):
         max_txt_len=opts.max_txt_len, in_memory=True,
         cat_file=data_cfg.cat_file,
         args=model_config, tok=tokenizer,
-        aug_img_db=aug_img_db
+        aug_img_db=aug_img_db,
+        vggt_ft_db=vggt_ft_db # <--- [Passed here]
     )
     val_nav_db = ReverieTextPathData(
         data_cfg.val_seen_traj_files, img_ft_db, obj_ft_db,
@@ -233,7 +249,8 @@ def main(opts):
         max_txt_len=opts.max_txt_len, in_memory=True,
         cat_file=data_cfg.cat_file,
         args=model_config, tok=tokenizer,
-        aug_img_db=aug_img_db
+        aug_img_db=aug_img_db,
+        vggt_ft_db=vggt_ft_db # <--- [Passed here]
     )
     val2_nav_db = ReverieTextPathData(
         data_cfg.val_unseen_traj_files, img_ft_db, obj_ft_db,
@@ -246,8 +263,10 @@ def main(opts):
         max_txt_len=opts.max_txt_len, in_memory=True,
         cat_file=data_cfg.cat_file,
         args=model_config, tok=tokenizer,
-        aug_img_db=aug_img_db
+        aug_img_db=aug_img_db,
+        vggt_ft_db=vggt_ft_db # <--- [Passed here]
     )
+    # ========================================================
 
     # Build data loaders
     train_dataloaders = create_dataloaders(
@@ -313,8 +332,8 @@ def main(opts):
         loss = loss.mean()  # loss is not normalized in model
 
         # backward pass
-        if args.gradient_accumulation_steps > 1: # average loss 
-            loss = loss / args.gradient_accumulation_steps
+        if opts.gradient_accumulation_steps > 1: # average loss 
+            loss = loss / opts.gradient_accumulation_steps
 
         delay_unscale = (step+1) % opts.gradient_accumulation_steps != 0
         if opts.fp16:

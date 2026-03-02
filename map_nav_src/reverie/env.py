@@ -24,13 +24,15 @@ class EnvBatch(object):
     ''' A simple wrapper for a batch of MatterSim environments,
         using discretized viewpoints and pretrained features '''
 
-    def __init__(self, connectivity_dir, scan_data_dir=None, feat_db=None, batch_size=100):
+    def __init__(self, connectivity_dir, scan_data_dir=None, feat_db=None, vggt_db=None, batch_size=100):
         """
         1. Load pretrained image feature
         2. Init the Simulator.
         :param feat_db: The name of file stored the feature.
         :param batch_size:  Used to create the simulator list.
         """
+
+        self.vggt_db = vggt_db
         self.aug_feat_db = None
         if type(feat_db) is list: 
             print('use aug features')
@@ -82,7 +84,13 @@ class EnvBatch(object):
                     feature = self.feat_db.get_image_feature(state.scanId, state.location.viewpointId)
             else:
                 feature = self.feat_db.get_image_feature(state.scanId, state.location.viewpointId)
-            feature_states.append((feature, state))
+            # get vggt features  
+            vggt_ft = None
+            if self.vggt_db is not None:
+                vggt_ft = self.vggt_db.get_image_feature(state.scanId, state.location.viewpointId)
+
+            # [修改] 返回元组增加一项
+            feature_states.append((feature, vggt_ft, state))
         return feature_states
 
     def makeActions(self, actions):
@@ -99,17 +107,18 @@ class ReverieObjectNavBatch(object):
         self, view_db, obj_db, instr_data, connectivity_dir, obj2vps, 
         multi_endpoints=False, multi_startpoints=False,
         batch_size=64, angle_feat_size=4, max_objects=None, seed=0, name=None, sel_data_idxs=None,tok=None,args=None,
-        scanvp_cands_file=None
+        scanvp_cands_file=None,
+        vggt_db=None # <--- [新增]
     ): 
         self.args = args
-        self.env = EnvBatch(connectivity_dir, feat_db=view_db, batch_size=batch_size)
+        self.env = EnvBatch(connectivity_dir, feat_db=view_db, vggt_db=vggt_db, batch_size=batch_size)
         self.obj_db = obj_db
         self.data = instr_data
 
         self.obj_image_h = 480
         self.obj_image_w = 640
         self.obj_image_size = 480 * 640
-
+        
         self.tok=tok
         if self.tok is not None:
             if 'speaker' in args.mode: # train speaker
@@ -438,7 +447,7 @@ class ReverieObjectNavBatch(object):
         
     def _get_obs(self):
         obs = []
-        for i, (feature, state) in enumerate(self.env.getStates()):
+        for i, (feature, vggt_ft, state) in enumerate(self.env.getStates()):
             item = self.batch[i]
             base_view_id = state.viewIndex
 
@@ -468,6 +477,7 @@ class ReverieObjectNavBatch(object):
                 'obj_img_fts': obj_img_fts, 
                 'obj_ang_fts': obj_ang_fts, 
                 'obj_box_fts': obj_box_fts, 
+                'view_vggt_fts': vggt_ft,
                 'obj_ids': obj_ids,
                 'navigableLocations' : state.navigableLocations,
                 'instruction' : item['instruction'],

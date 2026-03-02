@@ -1,11 +1,41 @@
-import random
+'''
+Instruction and trajectory dataset
+'''
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+import json
+import jsonlines
 import numpy as np
+import h5py
+import math
+import re
+import nltk
+import lmdb
+import base64
+import pickle
+import csv
+import random
+import time
+from collections import defaultdict
 
+# [新增] 导入 torch 用于 VGGT 特征的 Adaptive Pooling
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 from torch.nn.utils.rnn import pad_sequence
 
-from .common import pad_tensors
+from .common import load_nav_graphs
+from .common import get_angle_fts, get_view_rel_angles
+from .common import calculate_vp_rel_pos_fts
+from .common import softmax
+from .common import pad_tensors # 确保 common.py 里有这个
+
+from utils.logger import LOGGER
+
+# ================= Global Constants =================
+MAX_DIST = 30   # normalize
+MAX_STEP = 10   # normalize
+TRAIN_MAX_STEP = 20
 
 ############### Masked Language Modeling ###############
 def random_word(tokens, vocab_range, mask):
@@ -71,12 +101,16 @@ class MlmDataset(Dataset):
         output = {}
 
         txt_ids, txt_labels = random_word(inputs['instr_encoding'], 
-                            self.vocab_range, self.mask_token_id)
+                                          self.vocab_range, self.mask_token_id)
 
         output['txt_ids'] = torch.LongTensor(txt_ids)
         output['txt_labels'] = torch.LongTensor(txt_labels)
 
         output['traj_view_img_fts'] = [torch.from_numpy(x) for x in inputs['traj_view_img_fts']]
+        
+        # [新增] 读取 VGGT 特征
+        output['traj_view_vggt_fts'] = [torch.from_numpy(x) for x in inputs['traj_view_vggt_fts']]
+
         if 'traj_obj_img_fts' in inputs:
             output['traj_obj_img_fts'] = [torch.from_numpy(x) for x in inputs['traj_obj_img_fts']]  
             output['traj_reverie_obj_names'] = [torch.from_numpy(x) for x in inputs['traj_reverie_obj_names']]
@@ -122,6 +156,10 @@ def mlm_collate(inputs):
         sum([[len(y) for y in x] for x in batch['traj_view_img_fts']], [])
     )
     batch['traj_view_img_fts'] = pad_tensors(sum(batch['traj_view_img_fts'], []))
+    
+    # [新增] VGGT Padding
+    batch['traj_view_vggt_fts'] = pad_tensors(sum(batch['traj_view_vggt_fts'], []))
+
     if 'traj_obj_img_fts' in batch:
         batch['traj_vp_obj_lens'] = torch.LongTensor(
             sum([[len(y) for y in x] for x in batch['traj_obj_img_fts']], [])
@@ -133,7 +171,10 @@ def mlm_collate(inputs):
     batch['traj_nav_types'] = pad_sequence(sum(batch['traj_nav_types'], []), batch_first=True, padding_value=0)
 
     if 'traj_reverie_loc_fts' in batch: # REVERIE
-        batch['traj_reverie_loc_fts'] = pad_tensors(sum(batch['traj_reverie_loc_fts'], []))
+        if batch['traj_reverie_loc_fts'][0] is not None:
+            batch['traj_reverie_loc_fts'] = pad_tensors(sum(batch['traj_reverie_loc_fts'], []))
+        else:
+            batch['traj_reverie_loc_fts'] = None
     else:
         batch['traj_reverie_loc_fts'] = None
 
@@ -192,9 +233,9 @@ class MrcDataset(Dataset):
         self.tok = tok
         self.mask_prob = mask_prob
 
-        self.cls_token_id = self.tok.cls_token_id  
+        self.cls_token_id = self.tok.cls_token_id   
         self.sep_token_id = self.tok.sep_token_id   
-        self.pad_token_id = self.tok.pad_token_id  
+        self.pad_token_id = self.tok.pad_token_id   
 
         self.end_vp_pos_ratio = end_vp_pos_ratio
         
@@ -216,9 +257,16 @@ class MrcDataset(Dataset):
 
         output['traj_view_img_fts'] = [torch.from_numpy(x) for x in inputs['traj_view_img_fts']]
         
+        # [新增] 读取 VGGT 特征
+        output['traj_view_vggt_fts'] = [torch.from_numpy(x) for x in inputs['traj_view_vggt_fts']]
+
         # mask image
         view_mrc_masks = _get_img_mask(self.mask_prob, len(output['traj_view_img_fts'][-1]))
         output['traj_view_img_fts'][-1] = _mask_img_feat(output['traj_view_img_fts'][-1], view_mrc_masks)
+        
+        # [新增] 对 VGGT 特征应用完全相同的 Mask (防止几何信息泄漏)
+        output['traj_view_vggt_fts'][-1] = _mask_img_feat(output['traj_view_vggt_fts'][-1], view_mrc_masks)
+
         output['vp_view_probs'] = torch.from_numpy(inputs['vp_view_probs']) # no [stop]
         output['vp_view_mrc_masks'] = view_mrc_masks
         output['traj_loc_fts'] = [torch.from_numpy(x) for x in inputs['traj_loc_fts']]
@@ -274,6 +322,10 @@ def mrc_collate(inputs):
         sum([[len(y) for y in x] for x in batch['traj_view_img_fts']], [])
     )
     batch['traj_view_img_fts'] = pad_tensors(sum(batch['traj_view_img_fts'], []))
+    
+    # [新增] VGGT Padding
+    batch['traj_view_vggt_fts'] = pad_tensors(sum(batch['traj_view_vggt_fts'], []))
+
     batch['traj_loc_fts'] = pad_tensors(sum(batch['traj_loc_fts'], []))
     batch['traj_nav_types'] = pad_sequence(sum(batch['traj_nav_types'], []), batch_first=True, padding_value=0)
 
@@ -307,7 +359,10 @@ def mrc_collate(inputs):
         batch['traj_reverie_obj_names'] = pad_tensors(sum(batch['traj_reverie_obj_names'], []))
     
     if 'traj_reverie_loc_fts' in batch: # REVERIE
-        batch['traj_reverie_loc_fts'] = pad_tensors(sum(batch['traj_reverie_loc_fts'], []))
+        if batch['traj_reverie_loc_fts'][0] is not None:
+            batch['traj_reverie_loc_fts'] = pad_tensors(sum(batch['traj_reverie_loc_fts'], []))
+        else:
+            batch['traj_reverie_loc_fts'] = None
     else:
         batch['traj_reverie_loc_fts'] = None
 
@@ -355,6 +410,10 @@ class SapDataset(Dataset):
         output['txt_ids'] = torch.LongTensor(inputs['instr_encoding'])
 
         output['traj_view_img_fts'] = [torch.from_numpy(x) for x in inputs['traj_view_img_fts']]
+        
+        # [新增] 读取 VGGT 特征
+        output['traj_view_vggt_fts'] = [torch.from_numpy(x) for x in inputs['traj_view_vggt_fts']]
+
         if 'traj_obj_img_fts' in inputs:
             output['traj_obj_img_fts'] = [torch.from_numpy(x) for x in inputs['traj_obj_img_fts']]
             output['traj_reverie_obj_names'] = [torch.from_numpy(x) for x in inputs['traj_reverie_obj_names']]
@@ -403,6 +462,10 @@ def sap_collate(inputs):
         sum([[len(y) for y in x] for x in batch['traj_view_img_fts']], [])
     )
     batch['traj_view_img_fts'] = pad_tensors(sum(batch['traj_view_img_fts'], []))
+    
+    # [新增] VGGT Padding
+    batch['traj_view_vggt_fts'] = pad_tensors(sum(batch['traj_view_vggt_fts'], []))
+
     if 'traj_obj_img_fts' in batch:
         batch['traj_vp_obj_lens'] = torch.LongTensor(
             sum([[len(y) for y in x] for x in batch['traj_obj_img_fts']], [])
@@ -414,7 +477,10 @@ def sap_collate(inputs):
     batch['traj_nav_types'] = pad_sequence(sum(batch['traj_nav_types'], []), batch_first=True, padding_value=0)
 
     if 'traj_reverie_loc_fts' in batch: # REVERIE
-        batch['traj_reverie_loc_fts'] = pad_tensors(sum(batch['traj_reverie_loc_fts'], []))
+        if batch['traj_reverie_loc_fts'][0] is not None:
+            batch['traj_reverie_loc_fts'] = pad_tensors(sum(batch['traj_reverie_loc_fts'], []))
+        else:
+            batch['traj_reverie_loc_fts'] = None
     else:
         batch['traj_reverie_loc_fts'] = None
 
@@ -468,6 +534,10 @@ class OGDataset(Dataset):
         output['txt_ids'] = torch.LongTensor(inputs['instr_encoding'])
 
         output['traj_view_img_fts'] = [torch.from_numpy(x) for x in inputs['traj_view_img_fts']]
+        
+        # [新增] 读取 VGGT 特征
+        output['traj_view_vggt_fts'] = [torch.from_numpy(x) for x in inputs['traj_view_vggt_fts']]
+
         output['traj_obj_img_fts'] = [torch.from_numpy(x) for x in inputs['traj_obj_img_fts']]
         output['traj_loc_fts'] = [torch.from_numpy(x) for x in inputs['traj_loc_fts']]
         output['traj_nav_types'] = [torch.LongTensor(x) for x in inputs['traj_nav_types']]
@@ -517,13 +587,20 @@ def og_collate(inputs):
         sum([[len(y) for y in x] for x in batch['traj_obj_img_fts']], [])
     )
     batch['traj_view_img_fts'] = pad_tensors(sum(batch['traj_view_img_fts'], []))
+    
+    # [新增] VGGT Padding
+    batch['traj_view_vggt_fts'] = pad_tensors(sum(batch['traj_view_vggt_fts'], []))
+
     batch['traj_obj_img_fts'] = pad_tensors(sum(batch['traj_obj_img_fts'], []))
     batch['traj_loc_fts'] = pad_tensors(sum(batch['traj_loc_fts'], []))
     batch['traj_nav_types'] = pad_sequence(sum(batch['traj_nav_types'], []), batch_first=True, padding_value=0)
     batch['traj_reverie_obj_names'] = pad_tensors(sum(batch['traj_reverie_obj_names'], []))
     
     if 'traj_reverie_loc_fts' in batch: # REVERIE
-        batch['traj_reverie_loc_fts'] = pad_tensors(sum(batch['traj_reverie_loc_fts'], []))
+        if batch['traj_reverie_loc_fts'][0] is not None:
+            batch['traj_reverie_loc_fts'] = pad_tensors(sum(batch['traj_reverie_loc_fts'], []))
+        else:
+            batch['traj_reverie_loc_fts'] = None
     else:
         batch['traj_reverie_loc_fts'] = None
 
@@ -580,6 +657,10 @@ class CfpDataset(Dataset):
         output['txt_ids'] = torch.LongTensor(inputs['instr_encoding'])
 
         output['traj_view_img_fts'] = [torch.from_numpy(x) for x in inputs['traj_view_img_fts']]
+        
+        # [新增] 读取 VGGT 特征
+        output['traj_view_vggt_fts'] = [torch.from_numpy(x) for x in inputs['traj_view_vggt_fts']]
+
         if 'traj_obj_img_fts' in inputs:
             output['traj_obj_img_fts'] = [torch.from_numpy(x) for x in inputs['traj_obj_img_fts']]
             output['traj_reverie_obj_names'] = [torch.from_numpy(x) for x in inputs['traj_reverie_obj_names']]
@@ -629,6 +710,10 @@ def cfp_collate(inputs):
         sum([[len(y) for y in x] for x in batch['traj_view_img_fts']], [])
     )
     batch['traj_view_img_fts'] = pad_tensors(sum(batch['traj_view_img_fts'], []))
+    
+    # [新增] VGGT Padding
+    batch['traj_view_vggt_fts'] = pad_tensors(sum(batch['traj_view_vggt_fts'], []))
+
     if 'traj_obj_img_fts' in batch:
         batch['traj_vp_obj_lens'] = torch.LongTensor(
             sum([[len(y) for y in x] for x in batch['traj_obj_img_fts']], [])
@@ -640,7 +725,10 @@ def cfp_collate(inputs):
     batch['traj_nav_types'] = pad_sequence(sum(batch['traj_nav_types'], []), batch_first=True, padding_value=0)
 
     if 'traj_reverie_loc_fts' in batch: # REVERIE
-        batch['traj_reverie_loc_fts'] = pad_tensors(sum(batch['traj_reverie_loc_fts'], []))
+        if batch['traj_reverie_loc_fts'][0] is not None:
+            batch['traj_reverie_loc_fts'] = pad_tensors(sum(batch['traj_reverie_loc_fts'], []))
+        else:
+            batch['traj_reverie_loc_fts'] = None
     else:
         batch['traj_reverie_loc_fts'] = None
 
@@ -675,4 +763,3 @@ def cfp_collate(inputs):
         batch['img_z_pzs'] = batch['img_z_pzs'][0].repeat(traj_img_len,1).reshape(traj_img_len,-1,1)
         
     return batch
-

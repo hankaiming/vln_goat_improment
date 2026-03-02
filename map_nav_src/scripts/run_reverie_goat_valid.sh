@@ -1,6 +1,6 @@
 name=goat_reverie_valid
 DATA_ROOT=../datasets
-
+export NLTK_DATA="/workspace/VLN-GOAT/nltk_data"
 train_alg=dagger
 features=clip768
 ft_dim=768
@@ -12,8 +12,7 @@ seed=0
 outdir=${DATA_ROOT}/REVERIE/
 backdoor_dict_file=${DATA_ROOT}/REVERIE/navigator/goat_reverie/logs/backdoor/backdoor_update_features.tsv
 frontdoor_dict_file=${DATA_ROOT}/REVERIE/navigator/goat_reverie/logs/frontdoor/frontdoor_update_features.tsv
-resume_file=${DATA_ROOT}/REVERIE/navigator/goat_reverie/ckpts/best_val_unseen.pt
-
+resume_file=${DATA_ROOT}/REVERIE/vgllm/navigator/goat_reverie/ckpts/best_val_unseen.pt
 flag="--root_dir ${DATA_ROOT}
       --dataset reverie
       --output_dir ${outdir}
@@ -75,5 +74,5 @@ flag="--root_dir ${DATA_ROOT}
       "
 
 # train
-CUDA_VISIBLE_DEVICES='2' python -u reverie/main_nav_obj.py $flag  \
+CUDA_VISIBLE_DEVICES='1' python -u reverie/main_nav_obj.py $flag  \
       --resume_file ${resume_file}

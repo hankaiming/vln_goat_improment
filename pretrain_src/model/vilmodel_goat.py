@@ -1,4 +1,4 @@
-import json
+# GOAT
 import json
 import logging
 import math
@@ -15,9 +15,18 @@ import torch.nn.functional as F
 from torch import Tensor, device, dtype
 
 from transformers import BertPreTrainedModel
+from transformers.models.roberta.modeling_roberta import RobertaLayer
 
 from .ops import create_transformer_encoder
 from .ops import extend_neg_masks, gen_seq_masks, pad_tensors_wgrad
+from typing import Optional
+
+from transformers.modeling_utils import (
+    PreTrainedModel,
+    apply_chunking_to_forward,
+)
+logger = logging.getLogger(__name__)
+
 
 from .Bert_backbone import *
 
@@ -141,6 +150,8 @@ class LanguageEncoderDo(nn.Module):
                         instr_aug_embeds = instr_aug_embeds + z_landm_embeds
                     if front_txt_embeds is not None:
                         instr_aug_embeds = instr_aug_embeds + z_front_embeds
+                    elif self.config.do_front_txt and front_txt_embeds is not None:
+                        instr_aug_embeds = z_front_embeds
                         
                     aug_linear_weight = self.instr_aug_linear(instr_aug_embeds)
                     ori_linear_weight = self.instr_ori_linear(txt_embeds)
@@ -230,13 +241,34 @@ class ImageEmbeddings(nn.Module):
         split_traj_embeds = torch.split(traj_embeds, traj_step_lens, 0)
         split_traj_vp_lens = torch.split(traj_vp_lens, traj_step_lens, 0)
         return split_traj_embeds, split_traj_vp_lens
+    
 
 class CausalImageEmbeddings(nn.Module):
-    ''' Causal learning
+    ''' Causal learning & VGGT Feature Fusion
     '''
     def __init__(self, config):
         super().__init__()
         self.config = config
+
+        # =====================================================================
+        # VGGT: attention-pooling + projection -> hidden fusion
+        # =====================================================================
+        self.vggt_dim = 2048
+
+        # 1) 将每个 VGGT 子向量投影到 hidden_size（共���权重）
+        self.vggt_proj = nn.Linear(self.vggt_dim, config.hidden_size)
+        # 2) 在 K(=5) 维度上的可学习评分，用于 attention pooling
+        self.vggt_pool_score = nn.Linear(config.hidden_size, 1)
+        # 3) 后置小 MLP（可选，但推荐用于进一步融合）
+        self.vggt_post_mlp = nn.Sequential(
+            nn.Linear(config.hidden_size, config.hidden_size),
+            nn.GELU(),
+            BertLayerNorm(config.hidden_size, eps=1e-12),
+            nn.Linear(config.hidden_size, config.hidden_size),
+            BertLayerNorm(config.hidden_size, eps=1e-12)
+        )
+        self.vggt_pool_dropout = nn.Dropout(config.hidden_dropout_prob)
+        # =====================================================================
 
         ''' For interventional image
         '''
@@ -244,11 +276,13 @@ class CausalImageEmbeddings(nn.Module):
         self.img_layer_norm = BertLayerNorm(config.hidden_size, eps=1e-12)
         self.loc_linear = nn.Linear(config.angle_feat_size+3, config.hidden_size)
         self.loc_layer_norm = BertLayerNorm(config.hidden_size, eps=1e-12)
+        
         if config.name != 'REVERIE' and config.name != 'SOON':
             self.img_self_attn = BertAttention(config)
             self.img_self_encoder = create_transformer_encoder(
                 config, config.num_pano_layers, norm=True
             )
+            
         self.do_back_img = config.do_back_img
         if self.do_back_img:
             self.do_img_before_linear = nn.Linear(config.image_feat_size, config.hidden_size)
@@ -278,22 +312,62 @@ class CausalImageEmbeddings(nn.Module):
         '''For global map aggregation
         '''
         if config.adaptive_pano_fusion: 
-            self.adaptive_pano_attn = nn.Linear(config.hidden_size,1) # 768 -> 1
+            self.adaptive_pano_attn = nn.Linear(config.hidden_size,1) 
             self.adaptive_pano_act = ACT2FN[config.hidden_act]
             self.adaptive_softmax = nn.Softmax(dim=1)
 
         # 0: objects, 1: navigable
         self.layer_norm = BertLayerNorm(config.hidden_size, eps=1e-12)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
+
         
     def forward(
         self, traj_view_img_fts, traj_loc_fts, traj_nav_types, 
         traj_step_lens, traj_vp_view_lens, type_embed_layer, 
         traj_reverie_obj_fts=None, traj_reverie_obj_lens=None,
         traj_reverie_obj_locs=None, 
-        z_img_features=None, z_img_pzs=None, traj_reverie_obj_names=None
+        z_img_features=None, z_img_pzs=None, traj_reverie_obj_names=None,
+        traj_view_vggt_fts=None # <--- Recieve VGGT
     ):
+        # traj_view_img_fts: [B, Np, image_feat_size]  (可能 B==sum_steps)
+        # traj_view_vggt_fts: expected [B, Np, K, 2048] where K=5
         view_img_embeds = self.img_layer_norm(self.img_linear(traj_view_img_fts))
+
+        # =====================================================================
+        # VGGT: attention pooling on K dim -> project/MLP -> residual add
+        # =====================================================================
+        if traj_view_vggt_fts is not None:
+            x = traj_view_vggt_fts
+            if x.dim() != 4:
+                raise RuntimeError(f"traj_view_vggt_fts expected 4D tensor [B,Np,K,2048], got {x.shape}")
+
+            B, Np, K, D = x.shape
+            # project each sub-vector -> [B, Np, K, H]
+            x_proj = self.vggt_proj(x.view(B * Np * K, D))  # [B*Np*K, H]
+            x_proj = x_proj.view(B, Np, K, -1)              # [B, Np, K, H]
+
+            # attention pooling over K
+            scores = self.vggt_pool_score(x_proj).squeeze(-1)  # [B, Np, K]
+            attn = torch.softmax(scores, dim=-1).unsqueeze(-1) # [B, Np, K, 1]
+            pooled = torch.sum(x_proj * attn, dim=2)          # [B, Np, H]
+            pooled = self.vggt_pool_dropout(pooled)
+
+            # optional small MLP
+            vggt_embeds = self.vggt_post_mlp(pooled)          # [B, Np, H]
+
+            # ensure dtype/device compatibility
+            if vggt_embeds.dtype != view_img_embeds.dtype:
+                vggt_embeds = vggt_embeds.to(view_img_embeds.dtype)
+            if vggt_embeds.device != view_img_embeds.device:
+                vggt_embeds = vggt_embeds.to(view_img_embeds.device)
+
+            # residual add: require shapes match
+            if view_img_embeds.shape != vggt_embeds.shape:
+                # try to be informative rather than silently broadcasting
+                raise RuntimeError(f"shape mismatch when fusing vggt: view_img_embeds {view_img_embeds.shape} vs vggt_embeds {vggt_embeds.shape}")
+            view_img_embeds = view_img_embeds + vggt_embeds
+        # =====================================================================
+
         if self.config.name != 'REVERIE' and self.config.name != 'SOON':
             view_img_embeds = view_img_embeds + self.loc_layer_norm(self.loc_linear(traj_loc_fts))
         
@@ -309,7 +383,7 @@ class CausalImageEmbeddings(nn.Module):
                     encoder_hidden_states=view_img_embeds, encoder_attention_mask=extended_img_masks)[0]
             p_z_img = z_img_embeds * z_img_pzs.to(torch.float32)
             sum_z_img = torch.sum(p_z_img,1).unsqueeze(1) #[bs,1,dim]
-            view_img_embeds = self.img_after_linear(view_img_embeds) + self.do_back_img_after_linear(sum_z_img)
+            view_img_embeds = self.img_after_linear(view_img_embeds) + self.do_img_after_linear(sum_z_img)
             view_img_embeds = self.do_img_concat_layernorm(view_img_embeds)
 
         if self.config.name != 'REVERIE' and self.config.name != 'SOON':
@@ -322,7 +396,8 @@ class CausalImageEmbeddings(nn.Module):
         if traj_reverie_obj_fts is not None:
             reverie_obj_img_embeds = self.obj_reverie_linear(traj_reverie_obj_fts)
             if self.config.use_obj_name:
-                reverie_obj_img_embeds = reverie_obj_img_embeds + self.obj_name_linear(traj_reverie_obj_names)
+                if traj_reverie_obj_names is not None:
+                    reverie_obj_img_embeds = reverie_obj_img_embeds + self.obj_name_linear(traj_reverie_obj_names)
             reverie_obj_img_embeds = self.obj_reverie_layer_norm(reverie_obj_img_embeds) 
 
             img_embeds = []
@@ -362,6 +437,172 @@ class CausalImageEmbeddings(nn.Module):
             return split_traj_embeds, split_traj_vp_lens, split_traj_fused_embeds
         
         return split_traj_embeds, split_traj_vp_lens, None
+
+
+# class CausalImageEmbeddings(nn.Module):
+#     ''' Causal learning & VGGT Feature Fusion
+#     '''
+#     def __init__(self, config):
+#         super().__init__()
+#         self.config = config
+
+#         # =====================================================================
+#         # [修改: 两层 MLP + 加法融合 VGGT]
+#         # =====================================================================
+#         self.vggt_dim = 2048  
+        
+#         # 使用两层 MLP 充分处理 VGGT 特征，使其能与主干图像特征完美对齐
+#         self.vggt_mlp = nn.Sequential(
+#             nn.Linear(self.vggt_dim, config.hidden_size),
+#             nn.GELU(), # 加入非线性激活，提升特征转换能力
+#             BertLayerNorm(config.hidden_size, eps=1e-12),
+#             nn.Linear(config.hidden_size, config.hidden_size),
+#             BertLayerNorm(config.hidden_size, eps=1e-12)
+#         )
+#         # =====================================================================
+
+#         ''' For interventional image
+#         '''
+#         self.img_linear = nn.Linear(config.image_feat_size, config.hidden_size)
+#         self.img_layer_norm = BertLayerNorm(config.hidden_size, eps=1e-12)
+#         self.loc_linear = nn.Linear(config.angle_feat_size+3, config.hidden_size)
+#         self.loc_layer_norm = BertLayerNorm(config.hidden_size, eps=1e-12)
+        
+#         if config.name != 'REVERIE' and config.name != 'SOON':
+#             self.img_self_attn = BertAttention(config)
+#             self.img_self_encoder = create_transformer_encoder(
+#                 config, config.num_pano_layers, norm=True
+#             )
+            
+#         self.do_back_img = config.do_back_img
+#         if self.do_back_img:
+#             self.do_img_before_linear = nn.Linear(config.image_feat_size, config.hidden_size)
+#             self.do_img_layer_norm = BertLayerNorm(config.hidden_size, eps=1e-12)
+#             self.do_img_attn = BertAttention(config)
+#             self.do_img_after_linear = nn.Linear(config.hidden_size, config.hidden_size)
+#             self.img_after_linear = nn.Linear(config.hidden_size, config.hidden_size)
+#             self.do_img_concat_layernorm = BertLayerNorm(config.hidden_size, eps=1e-12)
+
+#             if self.config.do_add_method == 'door':
+#                 self.sigmoid = nn.Sigmoid()
+#             elif self.config.do_add_method == 'concat':
+#                 self.do_concat_img_linear = nn.Linear(config.hidden_size*2, config.hidden_size)
+
+#         '''For reverie'''
+#         if self.config.name == 'REVERIE' or self.config.name == 'SOON':
+#             self.obj_name_linear = nn.Embedding(config.obj_name_vocab_size, config.hidden_size)
+#             self.obj_reverie_linear = nn.Linear(config.obj_feat_size, config.hidden_size)
+#             self.obj_reverie_layer_norm = BertLayerNorm(config.hidden_size, eps=1e-12)
+#             self.nav_type_embedding = nn.Embedding(3, config.hidden_size)
+#             self.pano_encoder = create_transformer_encoder(
+#                         config, config.num_pano_layers, norm=True
+#                     )
+#         else:
+#             self.nav_type_embedding = nn.Embedding(2, config.hidden_size)
+
+#         '''For global map aggregation
+#         '''
+#         if config.adaptive_pano_fusion: 
+#             self.adaptive_pano_attn = nn.Linear(config.hidden_size,1) 
+#             self.adaptive_pano_act = ACT2FN[config.hidden_act]
+#             self.adaptive_softmax = nn.Softmax(dim=1)
+
+#         # 0: objects, 1: navigable
+#         self.layer_norm = BertLayerNorm(config.hidden_size, eps=1e-12)
+#         self.dropout = nn.Dropout(config.hidden_dropout_prob)
+
+        
+#     def forward(
+#         self, traj_view_img_fts, traj_loc_fts, traj_nav_types, 
+#         traj_step_lens, traj_vp_view_lens, type_embed_layer, 
+#         traj_reverie_obj_fts=None, traj_reverie_obj_lens=None,
+#         traj_reverie_obj_locs=None, 
+#         z_img_features=None, z_img_pzs=None, traj_reverie_obj_names=None,
+#         traj_view_vggt_fts=None # <--- Recieve VGGT
+#     ):
+#         view_img_embeds = self.img_layer_norm(self.img_linear(traj_view_img_fts))
+
+#         # =====================================================================
+#         # [修改: 两层 MLP + 加法融合 VGGT] 严格保证空间结构不被破坏
+#         # =====================================================================
+#         if traj_view_vggt_fts is not None:
+#             # 通过两层 MLP 将 VGGT 特征深度映射到与主干图像特征相同的子空间
+#             # [Batch, ..., 36, 2048] -> [Batch, ..., 36, 768]
+#             vggt_embeds = self.vggt_mlp(traj_view_vggt_fts)
+            
+#             # 使用加法进行残差式特征注入 (保持 View 一一对应)
+#             view_img_embeds = view_img_embeds + vggt_embeds
+#         # =====================================================================
+
+#         if self.config.name != 'REVERIE' and self.config.name != 'SOON':
+#             view_img_embeds = view_img_embeds + self.loc_layer_norm(self.loc_linear(traj_loc_fts))
+        
+#         img_masks = gen_seq_masks(traj_vp_view_lens)
+#         extended_img_masks = extend_neg_masks(img_masks)
+
+#         if z_img_features is not None:
+#             # Do intervention
+#             z_img_embeds = self.do_img_layer_norm(self.do_img_before_linear(z_img_features))
+#             if self.config.z_cross_attn:
+#                 z_img_embeds = self.do_img_attn(
+#                     z_img_embeds, 
+#                     encoder_hidden_states=view_img_embeds, encoder_attention_mask=extended_img_masks)[0]
+#             p_z_img = z_img_embeds * z_img_pzs.to(torch.float32)
+#             sum_z_img = torch.sum(p_z_img,1).unsqueeze(1) #[bs,1,dim]
+#             view_img_embeds = self.img_after_linear(view_img_embeds) + self.do_img_after_linear(sum_z_img)
+#             view_img_embeds = self.do_img_concat_layernorm(view_img_embeds)
+
+#         if self.config.name != 'REVERIE' and self.config.name != 'SOON':
+#             view_img_embeds = self.dropout(view_img_embeds)
+#             view_img_embeds = self.img_self_encoder(
+#                 view_img_embeds, src_key_padding_mask=img_masks.logical_not()
+#             )
+
+#         '''For REVERIE'''
+#         if traj_reverie_obj_fts is not None:
+#             reverie_obj_img_embeds = self.obj_reverie_linear(traj_reverie_obj_fts)
+#             if self.config.use_obj_name:
+#                 if traj_reverie_obj_names is not None:
+#                     reverie_obj_img_embeds = reverie_obj_img_embeds + self.obj_name_linear(traj_reverie_obj_names)
+#             reverie_obj_img_embeds = self.obj_reverie_layer_norm(reverie_obj_img_embeds) 
+
+#             img_embeds = []
+#             for view_embed, obj_embed, view_len, obj_len in zip(
+#                     view_img_embeds, reverie_obj_img_embeds, traj_vp_view_lens, traj_reverie_obj_lens
+#                 ):
+#                 if obj_len > 0:
+#                     img_embeds.append(torch.cat([view_embed[:view_len], obj_embed[:obj_len]], 0))
+#                 else:
+#                     img_embeds.append(view_embed[:view_len])
+#             img_embeds = pad_tensors_wgrad(img_embeds)
+#             traj_vp_view_lens = traj_vp_view_lens + traj_reverie_obj_lens
+
+#             fused_img_reverie_embeds =  img_embeds +\
+#                     self.nav_type_embedding(traj_nav_types) +\
+#                     self.loc_layer_norm(self.loc_linear(traj_loc_fts))
+            
+#             fused_img_reverie_embeds = self.layer_norm(fused_img_reverie_embeds)
+#             fused_img_reverie_embeds = self.dropout(fused_img_reverie_embeds)
+                
+#             img_masks = gen_seq_masks(traj_vp_view_lens)
+#             view_img_embeds = self.pano_encoder(
+#                 fused_img_reverie_embeds, src_key_padding_mask=img_masks.logical_not()
+#             )
+        
+#         split_traj_embeds = torch.split(view_img_embeds, traj_step_lens, 0)
+#         split_traj_vp_lens = torch.split(traj_vp_view_lens, traj_step_lens, 0)
+
+#         if self.config.adaptive_pano_fusion:
+#             traj_ori_embeds = view_img_embeds.clone()
+#             traj_fused_weight = self.adaptive_pano_attn(traj_ori_embeds)
+#             traj_fused_weight_act = torch.tanh(traj_fused_weight) 
+#             traj_fused_weight_act = self.adaptive_softmax(traj_fused_weight_act)
+#             traj_fused_embeded_update = torch.mul(traj_ori_embeds,traj_fused_weight_act)
+#             traj_fused_embeds = torch.sum(traj_fused_embeded_update,dim=1)
+#             split_traj_fused_embeds = torch.split(traj_fused_embeds, traj_step_lens, 0)
+#             return split_traj_embeds, split_traj_vp_lens, split_traj_fused_embeds
+        
+#         return split_traj_embeds, split_traj_vp_lens, None
 
 class LocalVPEncoder(nn.Module):
     def __init__(self, config):
@@ -486,11 +727,11 @@ class GlobalMapEncoder(nn.Module):
         self, txt_embeds, txt_masks,
         split_traj_embeds, split_traj_vp_lens, traj_vpids, traj_cand_vpids, gmap_vpids,
         gmap_step_ids, gmap_pos_fts, gmap_lens, graph_sprels=None,
-        split_traj_fused_embeds=None
+        split_traj_fused_embeds=None,
     ):
         gmap_embeds, gmap_masks = self.gmap_input_embedding(
             split_traj_embeds, split_traj_vp_lens, traj_vpids, traj_cand_vpids, gmap_vpids,
-            gmap_step_ids, gmap_pos_fts, gmap_lens, split_traj_fused_embeds=split_traj_fused_embeds
+            gmap_step_ids, gmap_pos_fts, gmap_lens, split_traj_fused_embeds=split_traj_fused_embeds,
         )
         
         if self.sprel_linear is not None:
@@ -503,7 +744,7 @@ class GlobalMapEncoder(nn.Module):
             graph_sprels=graph_sprels
         )
         return gmap_embeds
-
+    
     def forward_cfp(
         self, split_traj_embeds, split_traj_vp_lens, traj_vpids, traj_cand_vpids, gmap_vpids,
         gmap_step_ids, gmap_pos_fts, gmap_lens, graph_sprels=None,
@@ -552,6 +793,7 @@ class GlocalTextPathCMT(BertPreTrainedModel):
         traj_reverie_obj_names=None, 
         instr_z_landmark_features=None, instr_z_landmark_pzs=None,
         instr_z_direction_features=None, instr_z_direction_pzs=None,
+        traj_view_vggt_fts=None # <--- [必须添加] 接收 VGGT 参数
     ):        
         # text embedding
         txt_token_type_ids = torch.zeros_like(txt_ids)
@@ -564,11 +806,13 @@ class GlocalTextPathCMT(BertPreTrainedModel):
             txt_embeds = self.lang_encoder(txt_embeds, txt_masks)
         
         # trajectory embedding
+        # ================= [VGGT 传递点 1] =================
         split_traj_embeds, split_traj_vp_lens, split_traj_fused_embeds = self.img_embeddings(
             traj_view_img_fts, traj_loc_fts, traj_nav_types, 
             traj_step_lens, traj_vp_view_lens, self.embeddings.token_type_embeddings,
             traj_obj_img_fts, traj_vp_obj_lens, traj_reverie_loc_fts,
-            z_img_features, z_img_pzs, traj_reverie_obj_names
+            z_img_features, z_img_pzs, traj_reverie_obj_names,
+            traj_view_vggt_fts=traj_view_vggt_fts # <--- 传递给视觉融合模块
         )
         
         # gmap embeds
@@ -600,7 +844,8 @@ class GlocalTextPathCMT(BertPreTrainedModel):
         gmap_lens, gmap_step_ids, gmap_pos_fts, gmap_pair_dists, gmap_vpids, vp_pos_fts,
         z_img_features=None, z_img_pzs=None,traj_reverie_loc_fts=None,traj_reverie_obj_names=None,
         instr_z_landmark_features=None, instr_z_landmark_pzs=None,
-        instr_z_direction_features=None, instr_z_direction_pzs=None
+        instr_z_direction_features=None, instr_z_direction_pzs=None,
+        traj_view_vggt_fts=None # <--- [必须添加] 接收 VGGT 参数
     ):
         # text embedding
         txt_token_type_ids = torch.zeros_like(txt_ids)
@@ -613,11 +858,13 @@ class GlocalTextPathCMT(BertPreTrainedModel):
             txt_embeds = self.lang_encoder(txt_embeds, txt_masks)
         extended_txt_masks = extend_neg_masks(txt_masks)
         
+        # ================= [VGGT 传递点 2] =================
         split_traj_embeds, split_traj_vp_lens, split_traj_fused_embeds = self.img_embeddings(
             traj_view_img_fts, traj_loc_fts, traj_nav_types, 
             traj_step_lens, traj_vp_view_lens, self.embeddings.token_type_embeddings,
             traj_obj_img_fts, traj_vp_obj_lens, traj_reverie_loc_fts,
-            z_img_features, z_img_pzs, traj_reverie_obj_names
+            z_img_features, z_img_pzs, traj_reverie_obj_names,
+            traj_view_vggt_fts=traj_view_vggt_fts # <--- 传递给视觉融合模块
         )
         
         # gmap embeds
@@ -656,6 +903,7 @@ class GlocalTextPathCMT(BertPreTrainedModel):
         traj_reverie_obj_names=None,
         instr_z_landmark_features=None, instr_z_landmark_pzs=None,
         instr_z_direction_features=None, instr_z_direction_pzs=None,
+        traj_view_vggt_fts=None # <--- [必须添加] 接收 VGGT 参数
     ):        
         # text embedding
         txt_token_type_ids = torch.zeros_like(txt_ids)
@@ -668,11 +916,13 @@ class GlocalTextPathCMT(BertPreTrainedModel):
             txt_embeds = self.lang_encoder(txt_embeds, txt_masks)
         
         # trajectory embedding
+        # ================= [VGGT 传递点 3] =================
         split_traj_embeds, split_traj_vp_lens, split_traj_fused_embeds = self.img_embeddings(
             traj_view_img_fts, traj_loc_fts, traj_nav_types, 
             traj_step_lens, traj_vp_view_lens, self.embeddings.token_type_embeddings,
             traj_obj_img_fts, traj_vp_obj_lens, traj_reverie_loc_fts,
-            z_img_features, z_img_pzs, traj_reverie_obj_names
+            z_img_features, z_img_pzs, traj_reverie_obj_names,
+            traj_view_vggt_fts=traj_view_vggt_fts # <--- 传递给视觉融合模块
         )
         
         # gmap embeds
@@ -694,4 +944,3 @@ class GlocalTextPathCMT(BertPreTrainedModel):
             return gmap_embeds, vp_embeds, txt_embeds
         else:
             return gmap_embeds, vp_embeds
-    

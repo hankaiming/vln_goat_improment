@@ -20,6 +20,8 @@ patch_sklearn(['KMeans','DBSCAN'])
 from sklearn.cluster import KMeans
 import joblib
 import time
+import torch 
+import torch.nn.functional as F
 
 
 class ImageFeaturesDB(object):
@@ -71,6 +73,104 @@ class ImageFeaturesDB(object):
                                                     dtype=np.float32).reshape((views, -1))
                     self._feature_store[long_id] = ft
             ft = self._feature_store[key]
+        return ft
+    
+# map_nav_src/utils/data.py
+
+# # [新增] VGGT 特征读取类 (针对 2048 维预训练特征适配)
+# class VGGTFeaturesDB(object):
+#     def __init__(self, vggt_ft_file, image_feat_size=2048): # [修改] 默认改为 2048
+#         self.image_feat_size = image_feat_size
+#         self.vggt_ft_file = vggt_ft_file
+#         self._feature_store = {}
+
+#     def get_image_feature(self, scan, viewpoint):
+#         key = '%s_%s' % (scan, viewpoint)
+        
+#         # 1. 检查内存缓存
+#         if key in self._feature_store:
+#             return self._feature_store[key]
+        
+#         # 2. 从文件读取并处理
+#         # 默认返回全零，防止 Crash
+#         ft = np.zeros((36, self.image_feat_size), dtype=np.float32)
+        
+#         try:
+#             with h5py.File(self.vggt_ft_file, 'r') as f:
+#                 if key in f:
+#                     # 原始数据读取: [36, 49, 256]
+#                     raw_ft = f[key][...] 
+                    
+#                     # ================= [维度变换核心逻辑: 目标 2048] =================
+#                     if raw_ft.ndim == 3 and raw_ft.shape[1] == 49 and raw_ft.shape[2] == 256:
+#                         with torch.no_grad():
+#                             # 1. 转为 Tensor: [36, 49, 256]
+#                             ft_tensor = torch.from_numpy(raw_ft).float()
+                            
+#                             # 2. 变换维度适配 Pool2d: [Batch, Channel, H, W]
+#                             # [36, 49, 256] -> [36, 256, 49] -> [36, 256, 7, 7]
+#                             ft_tensor = ft_tensor.transpose(1, 2).reshape(raw_ft.shape[0], 256, 7, 7)
+                            
+#                             # 3. [关键] 自适应平均池化 (7x7 -> 2x4)
+#                             # 为了得到 2048 维 (256 * 8)，我们将 7x7 池化为 2x4 (共8块)
+#                             ft_tensor = F.adaptive_avg_pool2d(ft_tensor, (2, 4)) # Output: [36, 256, 2, 4]
+                            
+#                             # 4. 展平 (Flatten)
+#                             # [36, 256, 2, 4] -> [36, 256 * 8] -> [36, 2048]
+#                             ft_tensor = ft_tensor.flatten(1)
+                            
+#                             # 转回 Numpy
+#                             ft = ft_tensor.numpy()
+                            
+#                     elif raw_ft.shape[-1] == self.image_feat_size:
+#                         # 如果已经是 [36, 2048]，直接使用
+#                         ft = raw_ft.astype(np.float32)
+#                     else:
+#                         print(f"Warning: Unexpected VGGT shape for {key}: {raw_ft.shape}. Expected (36, 49, 256) or (36, {self.image_feat_size}).")
+                        
+#         except Exception as e:
+#             print(f"Error reading VGGT feature for {key}: {e}")
+            
+#         # 3. 存入缓存并返回
+#         self._feature_store[key] = ft
+#         return ft
+    
+
+# [新增] VGGT 特征读取类 (针对 2048 维预训练特征适配)
+class VGGTFeaturesDB(object):
+    def __init__(self, vggt_ft_file, image_feat_size=2048): 
+        self.image_feat_size = image_feat_size
+        self.vggt_ft_file = vggt_ft_file
+        self._feature_store = {}
+
+    def get_image_feature(self, scan, viewpoint):
+        key = '%s_%s' % (scan, viewpoint)
+        
+        # 1. 检查内存缓存
+        if key in self._feature_store:
+            return self._feature_store[key]
+        
+        # 2. 默认返回全零，防止文件或 key 不存在时 Crash
+        ft = np.zeros((36,5,self.image_feat_size), dtype=np.float32)
+        
+        try:
+            with h5py.File(self.vggt_ft_file, 'r') as f:
+                if key in f:
+                    # 原始数据读取：由于离线提取时已经做过 mean 池化
+                    # 这里读出来的 raw_ft 已经是 [36, 2048]
+                    raw_ft = f[key][...] 
+                    
+                    if raw_ft.shape[-1] == self.image_feat_size:
+                        # 维度匹配，直接赋值
+                        ft = raw_ft.astype(np.float32)
+                    else:
+                        print(f"Warning: Unexpected VGGT shape for {key}: {raw_ft.shape}. Expected (36, {self.image_feat_size}).")
+                        
+        except Exception as e:
+            print(f"Error reading VGGT feature for {key}: {e}")
+            
+        # 3. 存入缓存并返回
+        self._feature_store[key] = ft
         return ft
     
 def load_nav_graphs(connectivity_dir, scans):

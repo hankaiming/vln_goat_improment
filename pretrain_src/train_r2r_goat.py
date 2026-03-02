@@ -203,6 +203,18 @@ def main(opts):
     img_ft_db = read_img_features_from_h5py(data_cfg.img_ft_file, model_config.image_feat_size)
     aug_img_db = read_img_features_from_h5py(data_cfg.aug_img_file, model_config.image_feat_size)
 
+    vggt_h5_path = "/workspace/VLN-DUET/data/vggt_features_REGIERS.h5" 
+
+    LOGGER.info(f"Loading VGGT features from {vggt_h5_path} ...")
+    vggt_ft_db = None
+    if os.path.exists(vggt_h5_path):
+        # 使用项目自带的 H5PY 读取函数将特征读入内存字典
+        # 第二个参数 2048 是 VGGT 的特征维度
+        # 返回的 vggt_ft_db 是一个字典: {'scanId_viewpointId': numpy_array(36, 2048)}
+        vggt_ft_db = read_img_features_from_h5py(vggt_h5_path, 2048)
+    else:
+        LOGGER.warning(f"VGGT file not found at {vggt_h5_path}! Training will proceed with ZERO features.")
+
     # Intervention
     z_dicts = None
     if model_config.do_back_img or model_config.do_back_txt:
@@ -226,7 +238,8 @@ def main(opts):
         cat_file=data_cfg.cat_file,
         args=model_config, tok=tokenizer,
         aug_img_db=aug_img_db,
-        z_dicts=z_dicts
+        z_dicts=z_dicts,
+         vggt_ft_db=vggt_ft_db
     )
     val_nav_db = R2RTextPathData(
         data_cfg.val_seen_traj_files, img_ft_db,
@@ -238,7 +251,8 @@ def main(opts):
         cat_file=data_cfg.cat_file,
         args=model_config, tok=tokenizer,
         aug_img_db=aug_img_db,
-        z_dicts=z_dicts
+        z_dicts=z_dicts,
+         vggt_ft_db=vggt_ft_db
     )
     val2_nav_db = R2RTextPathData(
         data_cfg.val_unseen_traj_files, img_ft_db,
@@ -250,7 +264,8 @@ def main(opts):
         cat_file=data_cfg.cat_file,
         args=model_config, tok=tokenizer,
         aug_img_db=aug_img_db,
-        z_dicts=z_dicts
+        z_dicts=z_dicts,
+         vggt_ft_db=vggt_ft_db
     )
 
     # Build data loaders

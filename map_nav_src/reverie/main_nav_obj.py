@@ -21,7 +21,7 @@ from utils.distributed import init_distributed, is_default_gpu
 from utils.distributed import all_gather, merge_dist_results
 
 from utils.data import ImageFeaturesDB, KMeansPicker
-
+from utils.data import VGGTFeaturesDB
 from reverie.agent_obj_goat import GMapObjectNavAgent
 from reverie.data_utils import ObjectFeatureDB, construct_instrs, load_obj2vps
 from reverie.env import ReverieObjectNavBatch
@@ -187,7 +187,18 @@ def build_dataset(args, rank=0):
     else:
         front_feat_loader = None
 
+    # 1. 初始化图像特征 DB
     feat_db = ImageFeaturesDB(args.img_ft_file, args.image_feat_size)
+    
+    # 2. [新增] 初始化 VGGT DB
+    vggt_db = None
+    vggt_path = "/workspace/VLN-DUET/data/vggt_features_REGIERS.h5"  # 你的路径
+    if os.path.exists(vggt_path):
+        print(f"Loading VGGT features from {vggt_path}...")
+        vggt_db = VGGTFeaturesDB(vggt_path)
+    else:
+        print(f"Warning: VGGT file not found at {vggt_path}")
+
     obj_db = ObjectFeatureDB(args.obj_ft_file, args.obj_feat_size, cat_file=args.cat_file)
     obj2vps = load_obj2vps(os.path.join(args.anno_dir, 'BBoxes.json'))
 
@@ -212,8 +223,10 @@ def build_dataset(args, rank=0):
             batch_size=args.batch_size, max_objects=args.max_objects,
             angle_feat_size=args.angle_feat_size, 
             seed=args.seed+rank, sel_data_idxs=None, name='aug', 
-            multi_endpoints=args.multi_endpoints, multi_startpoints=args.multi_startpoints,tok=tok,args=args,
-            scanvp_cands_file=args.scanvp_cands_file
+            multi_endpoints=args.multi_endpoints, multi_startpoints=args.multi_startpoints,
+            tok=tok, args=args,
+            scanvp_cands_file=args.scanvp_cands_file,
+            vggt_db=vggt_db  # <--- [新增] 传入 vggt_db
         )
     else:
         aug_env = None
@@ -229,8 +242,10 @@ def build_dataset(args, rank=0):
         batch_size=args.batch_size, max_objects=args.max_objects,
         angle_feat_size=args.angle_feat_size, seed=args.seed+rank,
         sel_data_idxs=None, name='train', 
-        multi_endpoints=args.multi_endpoints, multi_startpoints=args.multi_startpoints,tok=tok,args=args,
-        scanvp_cands_file=args.scanvp_cands_file
+        multi_endpoints=args.multi_endpoints, multi_startpoints=args.multi_startpoints,
+        tok=tok, args=args,
+        scanvp_cands_file=args.scanvp_cands_file,
+        vggt_db=vggt_db  # <--- [新增] 传入 vggt_db
     )
 
     val_env_names = ['val_train_seen', 'val_seen', 'val_unseen']
@@ -248,8 +263,10 @@ def build_dataset(args, rank=0):
             feat_db, obj_db, val_instr_data, args.connectivity_dir, obj2vps, batch_size=args.batch_size, 
             angle_feat_size=args.angle_feat_size, seed=args.seed+rank,
             sel_data_idxs=None if args.world_size < 2 else (rank, args.world_size), name=split,
-            max_objects=None, multi_endpoints=False, multi_startpoints=False,tok=tok,args=args,
-            scanvp_cands_file=args.scanvp_cands_file
+            max_objects=None, multi_endpoints=False, multi_startpoints=False,
+            tok=tok, args=args,
+            scanvp_cands_file=args.scanvp_cands_file,
+            vggt_db=vggt_db  # <--- [新增] 传入 vggt_db
         )   # evaluation using all objects
         val_envs[split] = val_env
 

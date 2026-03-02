@@ -14,9 +14,12 @@ import lmdb
 import base64
 import pickle
 import csv
-import torch
 import random
 import time
+from collections import defaultdict
+
+import torch
+import torch.nn.functional as F
 
 from .common import load_nav_graphs
 from .common import get_angle_fts, get_view_rel_angles
@@ -25,15 +28,18 @@ from .common import softmax
 
 from utils.logger import LOGGER
 
+# ================= Global Constants =================
 MAX_DIST = 30   # normalize
 MAX_STEP = 10   # normalize
 TRAIN_MAX_STEP = 20
+
+# ================= Helper Functions =================
 
 def read_category_file(infile):
     category_mapping = {}
     category_list = []
     category_number = {}
-    with open(infile, 'r',encoding='utf-8') as f:
+    with open(infile, 'r', encoding='utf-8') as f:
         next(f) 
         for line in f:
             line = line.strip('\n').split('\t')  
@@ -42,14 +48,13 @@ def read_category_file(infile):
             if target_category not in category_list:
                 category_list.append(target_category)
         category_list.append('others')
-        for i,cat in enumerate(category_list):
+        for i, cat in enumerate(category_list):
             category_number[cat] = i
     return category_mapping, category_number
 
-def preprocess_name(name,cat_mapping,cat_number):
-    ''' preprocess the name of object
-    '''
-    name = re.sub(r'[^\w\s]',' ',str(name).lower().strip())
+def preprocess_name(name, cat_mapping, cat_number):
+    ''' preprocess the name of object '''
+    name = re.sub(r'[^\w\s]', ' ', str(name).lower().strip())
     lem = nltk.stem.wordnet.WordNetLemmatizer()
     name = lem.lemmatize(name) # convert the word into root word
     name = ''.join([i for i in name if not i.isdigit()]) # remove number
@@ -63,6 +68,8 @@ def preprocess_name(name,cat_mapping,cat_number):
             name = 'others'
     number = cat_number[name]
     return name, number
+
+# ================= Classes =================
 
 class LoadZdict():
     def __init__(self, img_zdict_file, obj_zdict_file, txt_zdict_file):
@@ -136,12 +143,18 @@ class ReverieTextPathData(object):
         image_feat_size=2048, image_prob_size=1000, angle_feat_size=4,
         obj_feat_size=None, obj_prob_size=None, max_objects=20,
         max_txt_len=100, in_memory=True, act_visited_node=False,
-        cat_file=None,args=None,tok=None,
-        aug_img_db=None, z_dicts=None
+        cat_file=None, args=None, tok=None,
+        aug_img_db=None, z_dicts=None,
+        vggt_ft_db=None,   # <--- [新增] 接收 VGGT 数据库句柄
+        caption_file='/workspace/VLN-DUET/data/vln_image_captions_roberta.json'
     ):  
         self.args = args
         self._feature_store = img_ft_db
         self._obj_feat_store = obj_ft_db
+        self._vggt_feature_store = vggt_ft_db # [新增] 保存 VGGT 句柄
+        
+        # [新增] VGGT 目标维度 (2048)
+        self.vggt_feat_size = 2048 
         
         self.cat_file = cat_file
         self.object_data = None
@@ -199,11 +212,10 @@ class ReverieTextPathData(object):
                             item['objId'] = item['instr_id'].split('_')[1]
                         self.data.append(item)
                         
-                    if self.args.debug and i >= 50:
+                    if self.args and getattr(self.args, 'for_debug', False) and i >= 50:
                         break
         
         if aug_img_db is not None:
-            # self.aug_img_file = aug_img_db
             self.use_aug_ft = True
             self._aug_feature_store = aug_img_db
             print("Using augmented image feature in EnvEdit!")
@@ -217,12 +229,15 @@ class ReverieTextPathData(object):
 
     def get_scanvp_feature(self, scan, viewpoint, type='tsv'):
         key = str(scan) + '_' + str(viewpoint)
+        # 读取 Object Features
+        obj_attrs = {}
+        obj_ft = np.zeros((0, self.obj_feat_size+self.obj_prob_size), dtype=np.float32)
+        
         if self._obj_feat_store is not None:
-            obj_attrs = {}
-            obj_ft = np.zeros((0, self.obj_feat_size+self.obj_prob_size), dtype=np.float32)
             if key in self._obj_feat_store:
                 obj_ft, obj_attrs = self._obj_feat_store[key]
                 
+        # 读取 Image Features
         if self.use_aug_ft: 
             if np.random.rand() > 0.5:
                 img_ft = self.get_aug_image_feature(scan, viewpoint)
@@ -237,7 +252,12 @@ class ReverieTextPathData(object):
             elif type == 'tsv':
                 img_ft = self.get_image_feature_from_tsv(scan, viewpoint)
         
-        return img_ft, obj_ft, obj_attrs
+        # [修改] 提取 VGGT 特征
+        vggt_ft = np.zeros((36, 5,self.vggt_feat_size), dtype=np.float32)
+        if self._vggt_feature_store is not None and key in self._vggt_feature_store:
+            vggt_ft = self._vggt_feature_store[key]
+        
+        return img_ft, vggt_ft, obj_ft, obj_attrs
 
     def get_image_feature_from_h5py(self, scan, viewpoint):
         key = '%s_%s' % (scan, viewpoint)
@@ -251,68 +271,31 @@ class ReverieTextPathData(object):
     
     def get_image_feature_from_tsv(self, scan, viewpoint):
         key = '%s_%s' % (scan, viewpoint)
-        views = 36
         if key in self._feature_store:
             ft = self._feature_store[key]
         else:
-            scanIds = []
-            tsv_fieldnames = ['scanId', 'viewpointId', 'image_w', 'image_h', 'vfov', 'features']
-            scanIds_viewpointsId = {}
-            with open(self.img_ft_file, "r") as tsv_in_file:     # Open the tsv file.
-                reader = csv.DictReader(tsv_in_file, delimiter='\t', fieldnames=tsv_fieldnames)
-                for item in reader:
-                    scanId = item['scanId']
-                    if scanId not in scanIds:
-                        scanIds.append(scanId)
-                        scanIds_viewpointsId[scanId] = []
-                        scanIds_viewpointsId[scanId].append(item['viewpointId'])
-                    else:
-                        scanIds_viewpointsId[scanId].append(item['viewpointId'])
-                    long_id = item['scanId'] + "_" + item['viewpointId']
-                    ft = np.frombuffer(base64.decodebytes(item['features'].encode('ascii')),
-                                                    dtype=np.float32).reshape((views, -1))
-                    self._feature_store[long_id] = ft
+            return np.zeros((36, self.image_feat_size), dtype=np.float32)
         return ft
 
     def get_aug_image_feature(self, scan, viewpoint):
         key = '%s_%s' % (scan, viewpoint)
-        views = 36
         if key in self._aug_feature_store:
             ft = self._aug_feature_store[key]
         else:
-            scanIds = []
-            tsv_fieldnames = ['scanId', 'viewpointId', 'image_w', 'image_h', 'vfov', 'features']
-            scanIds_viewpointsId = {}
-
-            with open(self.aug_img_file, "r") as tsv_in_file:     # Open the tsv file.
-                reader = csv.DictReader(tsv_in_file, delimiter='\t', fieldnames=tsv_fieldnames)
-                for item in reader:
-                    scanId = item['scanId']
-                    if scanId not in scanIds:
-                        scanIds.append(scanId)
-                        scanIds_viewpointsId[scanId] = []
-                        scanIds_viewpointsId[scanId].append(item['viewpointId'])
-                    else:
-                        scanIds_viewpointsId[scanId].append(item['viewpointId'])
-                    long_id = item['scanId'] + "_" + item['viewpointId']
-                    ft = np.frombuffer(base64.decodebytes(item['features'].encode('ascii')),
-                                                    dtype=np.float32).reshape((views, -1))
-                    self._feature_store[long_id] = ft
+             return np.zeros((36, self.image_feat_size), dtype=np.float32)
         return ft
 
     def get_obj_label(self, item, last_vp_objids):
         if 'objId' in item.keys():
             gt_obj_id = item['objId'] # Aug
         else:
-            gt_obj_id = item['instr_id'].split('_')[1] # By default, instr_id in reverie pre-train contains pathId_objId_instrId
+            gt_obj_id = item['instr_id'].split('_')[1] 
         for k, obj_id in enumerate(last_vp_objids):
             if obj_id == gt_obj_id:
                 obj_label = k
                 break
         else:
-            # it occurs when the gt_objid is not in max_objects
             obj_label = -100 # ignore 
-            # print('No groundtruth obj_id', item['instr_id'], len(obj_ids))
         return obj_label
 
     def get_act_labels(self, end_vp, item, gmap_vpids, gmap_visited_masks, traj_cand_vpids):
@@ -326,19 +309,21 @@ class ReverieTextPathData(object):
             cand_min_dist = float('inf')
             for k, cand_vp in enumerate(gmap_vpids):
                 if (k > 0) and (not gmap_visited_masks[k]):
+                    if cand_vp in self.shortest_distances[scan][end_vp]:
+                         min_dist = min([self.shortest_distances[scan][end_vp][cand_vp] \
+                            + self.shortest_distances[scan][cand_vp][pos_vp] for pos_vp in pos_vps])
+                         if min_dist < cand_min_dist:
+                            cand_min_dist = min_dist
+                            global_act_label = k # [stop] is 0
+            # local: 
+            cand_min_dist = float('inf')
+            for k, cand_vp in enumerate(traj_cand_vpids[-1]):
+                if cand_vp in self.shortest_distances[scan][end_vp]:
                     min_dist = min([self.shortest_distances[scan][end_vp][cand_vp] \
                         + self.shortest_distances[scan][cand_vp][pos_vp] for pos_vp in pos_vps])
                     if min_dist < cand_min_dist:
                         cand_min_dist = min_dist
-                        global_act_label = k # [stop] is 0
-            # local: 
-            cand_min_dist = float('inf')
-            for k, cand_vp in enumerate(traj_cand_vpids[-1]):
-                min_dist = min([self.shortest_distances[scan][end_vp][cand_vp] \
-                    + self.shortest_distances[scan][cand_vp][pos_vp] for pos_vp in pos_vps])
-                if min_dist < cand_min_dist:
-                    cand_min_dist = min_dist
-                    local_act_label = k + 1 # [stop] is 0
+                        local_act_label = k + 1 # [stop] is 0
         return global_act_label, local_act_label
 
     def get_input(
@@ -372,7 +357,8 @@ class ReverieTextPathData(object):
             # truncate trajectory
             gt_path = gt_path[:TRAIN_MAX_STEP] + [end_vp]
         
-        traj_view_img_fts, traj_obj_img_fts, traj_loc_fts, traj_reverie_loc_fts, traj_nav_types, traj_cand_vpids, \
+        # [修改] 接收 traj_view_vggt_fts
+        traj_view_img_fts, traj_view_vggt_fts, traj_obj_img_fts, traj_loc_fts, traj_reverie_loc_fts, traj_nav_types, traj_cand_vpids, \
             last_vp_angles, last_vp_objids, traj_reverie_obj_names = self.get_traj_pano_fts(scan, gt_path, cur_heading, cur_elevation)
 
         # global: the first token is [stop]
@@ -389,6 +375,7 @@ class ReverieTextPathData(object):
             'instr_encoding': item['instr_encoding'][:self.max_txt_len],
             
             'traj_view_img_fts': [x[:, :self.image_feat_size] for x in traj_view_img_fts],
+            'traj_view_vggt_fts': traj_view_vggt_fts,  # <--- [新增] 放入输出字典
             'traj_obj_img_fts': [x[:, :self.obj_feat_size] for x in traj_obj_img_fts],
             'traj_loc_fts': traj_loc_fts,
             'traj_reverie_loc_fts': traj_reverie_loc_fts,
@@ -421,7 +408,6 @@ class ReverieTextPathData(object):
             outs['vp_view_probs'] = softmax(traj_view_img_fts[-1][:, self.image_feat_size:], dim=1)
             outs['vp_obj_probs'] = softmax(traj_obj_img_fts[-1][:, self.obj_feat_size:], dim=1)
     
-
         return outs
 
     def get_cur_angle(self, scan, path, start_heading):
@@ -439,23 +425,31 @@ class ReverieTextPathData(object):
     def get_traj_pano_fts(self, scan, path, cur_heading, cur_elevation):
         '''
         Tokens in each pano: [cand_views, noncand_views, objs]
-        Each token consists of (img_fts, loc_fts (ang_fts, box_fts), nav_types)
         '''
         traj_view_img_fts, traj_obj_img_fts, traj_loc_fts, traj_nav_types, traj_cand_vpids = [], [], [], [], []
         traj_reverie_loc_fts = []
         traj_reverie_obj_names = []
+        
+        # [新增] 初始化 VGGT 轨迹列表
+        traj_view_vggt_fts = []
+
         for vp in path:
-            view_fts, obj_img_fts, obj_attrs = self.get_scanvp_feature(scan, vp)
+            # [修] 解包返回值，增加 vggt_fts
+            view_fts, vggt_fts, obj_img_fts, obj_attrs = self.get_scanvp_feature(scan, vp)
 
             view_img_fts, view_angles, cand_vpids = [], [], []
+            view_vggt_fts = [] # [新增] 当前视点的 VGGT 列表
+
             # cand views
             nav_cands = self.scanvp_cands['%s_%s'%(scan, vp)]
             used_viewidxs = set()
             for k, v in nav_cands.items():
                 used_viewidxs.add(v[0])
                 view_img_fts.append(view_fts[v[0]])
+                view_vggt_fts.append(vggt_fts[v[0]]) # [新增]
+                
                 view_angle = self.all_point_rel_angles[12][v[0]]
-                if self.args.correct_heading: 
+                if self.args and getattr(self.args, 'correct_heading', False): 
                     heading = cur_heading - view_angle[0] + v[2]
                     elevation = cur_elevation - view_angle[1] + v[3]
                 else:
@@ -465,10 +459,15 @@ class ReverieTextPathData(object):
                 cand_vpids.append(k)
                 
             # non cand views
-            view_img_fts.extend([view_fts[idx] for idx in range(36) if idx not in used_viewidxs])
-            view_angles.extend([self.all_point_rel_angles[12][idx] for idx in range(36) if idx not in used_viewidxs])
+            for idx in range(36):
+                if idx not in used_viewidxs:
+                    view_img_fts.append(view_fts[idx])
+                    view_vggt_fts.append(vggt_fts[idx]) # [新增] 添加非候选点 VGGT
+                    view_angles.append(self.all_point_rel_angles[12][idx])
+
             # combine cand views and noncand views
             view_img_fts = np.stack(view_img_fts, 0)    # (n_views, dim_ft)
+            view_vggt_fts = np.stack(view_vggt_fts, 0)  # [新增] (n_views, 2048)
             view_angles = np.stack(view_angles, 0)
             view_ang_fts = get_angle_fts(view_angles[:, 0], view_angles[:, 1], self.angle_feat_size)
             view_box_fts = np.array([[1, 1, 1]] * len(view_img_fts)).astype(np.float32)
@@ -478,7 +477,7 @@ class ReverieTextPathData(object):
             obj_angles = np.zeros((num_objs, 2), dtype=np.float32)
             obj_ang_fts = np.zeros((num_objs, self.angle_feat_size), dtype=np.float32)
             obj_box_fts = np.zeros((num_objs, 3), dtype=np.float32)
-            obj_names = np.array([0],dtype=np.int)
+            obj_names = np.array([0],dtype=np.int64) 
             if num_objs > 0:
                 for k, (w, h) in enumerate(obj_attrs['sizes']):
                     obj_angles[k] = obj_attrs['directions'][k]
@@ -488,6 +487,7 @@ class ReverieTextPathData(object):
 
             # combine pano features
             traj_view_img_fts.append(view_img_fts)
+            traj_view_vggt_fts.append(view_vggt_fts) # [新增]
             traj_obj_img_fts.append(obj_img_fts)
             traj_loc_fts.append(
                 np.concatenate(
@@ -505,11 +505,12 @@ class ReverieTextPathData(object):
             last_vp_objids = obj_attrs.get('obj_ids', [])
             last_vp_angles = np.concatenate([view_angles, obj_angles], 0)
 
-        return traj_view_img_fts, traj_obj_img_fts, traj_loc_fts, traj_reverie_loc_fts, traj_nav_types, traj_cand_vpids, \
+        # [修改] 返回值增加 traj_view_vggt_fts
+        return traj_view_img_fts, traj_view_vggt_fts, traj_obj_img_fts, traj_loc_fts, traj_reverie_loc_fts, traj_nav_types, traj_cand_vpids, \
             last_vp_angles, last_vp_objids, traj_reverie_obj_names
         
     def get_gmap_inputs(self, scan, path, cur_heading, cur_elevation):
-        scan_graph = self.graphs[scan]
+        # scan_graph = self.graphs[scan]
         cur_vp = path[-1]
 
         visited_vpids, unvisited_vpids = {}, {}
@@ -517,9 +518,10 @@ class ReverieTextPathData(object):
             visited_vpids[vp] = t + 1
             if vp in unvisited_vpids:
                 del unvisited_vpids[vp]
-            for next_vp in self.scanvp_cands['%s_%s'%(scan, vp)].keys():
-                if next_vp not in visited_vpids:
-                    unvisited_vpids[next_vp] = 0
+            if self.scanvp_cands['%s_%s'%(scan, vp)]:
+                for next_vp in self.scanvp_cands['%s_%s'%(scan, vp)].keys():
+                    if next_vp not in visited_vpids:
+                        unvisited_vpids[next_vp] = 0
         # add [stop] token
         gmap_vpids = [None] + list(visited_vpids.keys()) + list(unvisited_vpids.keys())
         gmap_step_ids = [0] + list(visited_vpids.values()) + list(unvisited_vpids.values())
@@ -539,8 +541,9 @@ class ReverieTextPathData(object):
         gmap_pair_dists = np.zeros((len(gmap_vpids), len(gmap_vpids)), dtype=np.float32)
         for i in range(1, len(gmap_vpids)):
             for j in range(i+1, len(gmap_vpids)):
-                gmap_pair_dists[i, j] = gmap_pair_dists[j, i] = \
-                    self.shortest_distances[scan][gmap_vpids[i]][gmap_vpids[j]]
+                if gmap_vpids[j] in self.shortest_distances[scan][gmap_vpids[i]]:
+                    gmap_pair_dists[i, j] = gmap_pair_dists[j, i] = \
+                        self.shortest_distances[scan][gmap_vpids[i]][gmap_vpids[j]]
 
         return gmap_vpids, gmap_step_ids, gmap_visited_masks, gmap_pos_fts, gmap_pair_dists
     
@@ -559,9 +562,15 @@ class ReverieTextPathData(object):
                     base_heading=cur_heading, base_elevation=cur_elevation,
                 )
                 rel_angles.append([rel_heading, rel_elevation])
+                
+                # Check dict existence to prevent KeyError if graph incomplete
+                s_dist = self.shortest_distances[scan][cur_vp].get(vp, MAX_DIST)
+                s_path_len = len(self.shortest_paths[scan][cur_vp].get(vp, [])) - 1
+                if s_path_len < 0: s_path_len = MAX_STEP # fallback
+
                 rel_dists.append(
-                    [rel_dist / MAX_DIST, self.shortest_distances[scan][cur_vp][vp] / MAX_DIST, \
-                    (len(self.shortest_paths[scan][cur_vp][vp]) - 1) / MAX_STEP]
+                    [rel_dist / MAX_DIST, s_dist / MAX_DIST, \
+                    s_path_len / MAX_STEP]
                 )
         rel_angles = np.array(rel_angles).astype(np.float32)
         rel_dists = np.array(rel_dists).astype(np.float32)
@@ -585,7 +594,8 @@ class R2RTextPathData(ReverieTextPathData):
         image_feat_size=2048, image_prob_size=1000, angle_feat_size=4,
         max_txt_len=100, in_memory=True, act_visited_node=False,
         cat_file=None,args=None,tok=None,
-        aug_img_db=None, z_dicts=None
+        aug_img_db=None, z_dicts=None,
+        vggt_ft_db=None # <--- [新增] 接收 VGGT
     ):
         super().__init__(
             anno_files, img_ft_db, None, scanvp_cands_file, connectivity_dir,
@@ -594,24 +604,33 @@ class R2RTextPathData(ReverieTextPathData):
             max_objects=0, max_txt_len=max_txt_len, in_memory=in_memory,
             act_visited_node=act_visited_node,
             cat_file=cat_file,args=args,tok=tok,
-            aug_img_db=aug_img_db, z_dicts=z_dicts
+            aug_img_db=aug_img_db, z_dicts=z_dicts,
+            vggt_ft_db=vggt_ft_db # <--- [新增] 传递给父类
         )
 
-    def get_scanvp_feature(self, scan, viewpoint, type='hdf5'):
+    def get_scanvp_feature(self, scan, viewpoint, type='tsv'): # R2R default to TSV
+        key = '%s_%s' % (scan, viewpoint) # <--- 【关键修复】确保此处定义了 key，否则会报错
+        
         if self.use_aug_ft: 
             if np.random.rand() > 0.5:
-                return self.get_aug_image_feature(scan, viewpoint)
+                img_ft = self.get_aug_image_feature(scan, viewpoint)
             else:
                 if type == 'hdf5':
-                    return self.get_image_feature_from_h5py(scan, viewpoint)
+                    img_ft = self.get_image_feature_from_h5py(scan, viewpoint)
                 elif type == 'tsv':
-                    return self.get_image_feature_from_tsv(scan, viewpoint)
+                    img_ft = self.get_image_feature_from_tsv(scan, viewpoint)
         else:
             if type == 'hdf5':
-                    return self.get_image_feature_from_h5py(scan, viewpoint)
+                    img_ft = self.get_image_feature_from_h5py(scan, viewpoint)
             elif type == 'tsv':
-                return self.get_image_feature_from_tsv(scan, viewpoint)
-
+                img_ft = self.get_image_feature_from_tsv(scan, viewpoint)
+        
+        # [修改] 提取 VGGT 特征
+        vggt_ft = np.zeros((36, 5,self.vggt_feat_size), dtype=np.float32)
+        if self._vggt_feature_store is not None and key in self._vggt_feature_store:
+            vggt_ft = self._vggt_feature_store[key]
+        
+        return img_ft, vggt_ft
 
     def get_act_labels(self, end_vp, end_idx, item, gmap_vpids, traj_cand_vpids):
         if end_vp == item['path'][-1]:  # stop
@@ -661,7 +680,8 @@ class R2RTextPathData(ReverieTextPathData):
             # truncate trajectory
             gt_path = gt_path[:TRAIN_MAX_STEP] + [end_vp]
         
-        traj_view_img_fts, traj_loc_fts, traj_nav_types, traj_cand_vpids, \
+        # [修改] 接收 get_traj_pano_fts 返回的 vggt 特征
+        traj_view_img_fts, traj_view_vggt_fts, traj_loc_fts, traj_nav_types, traj_cand_vpids, \
             last_vp_angles = self.get_traj_pano_fts(scan, gt_path, cur_heading, cur_elevation)
 
         # global: the first token is [stop]
@@ -677,6 +697,7 @@ class R2RTextPathData(ReverieTextPathData):
             'instr_encoding': item['instr_encoding'][:self.max_txt_len],
             
             'traj_view_img_fts': [x[:, :self.image_feat_size] for x in traj_view_img_fts],
+            'traj_view_vggt_fts': traj_view_vggt_fts, # <--- [新增] 放入输出
             'traj_loc_fts': traj_loc_fts,
             'traj_reverie_loc_fts': None,
             'traj_nav_types': traj_nav_types,
@@ -703,9 +724,9 @@ class R2RTextPathData(ReverieTextPathData):
             outs['local_act_labels'] = local_act_label
 
         if return_img_probs:
-            # TODO: whether adding gmap img probs
             outs['vp_view_probs'] = softmax(traj_view_img_fts[-1][:, self.image_feat_size:], dim=1)
         
+        # 添加 GOAT 特有的因果干预特征 (Z-Dicts)
         if self.z_dicts is not None:
             img_zdict = self.z_dicts['img_zdict']
             instr_zdict = self.z_dicts['instr_zdict']
@@ -726,18 +747,24 @@ class R2RTextPathData(ReverieTextPathData):
         Each token consists of (img_fts, loc_fts (ang_fts, box_fts), nav_types)
         '''
         traj_view_img_fts, traj_loc_fts, traj_nav_types, traj_cand_vpids = [], [], [], []
+        traj_view_vggt_fts = [] # [新增]
 
         for vp in path:
-            view_fts = self.get_scanvp_feature(scan, vp)
+            # [修改] 接收两个返回值
+            view_fts, vggt_fts = self.get_scanvp_feature(scan, vp) 
+            
             view_img_fts, view_angles, cand_vpids = [], [], []
+            view_vggt_fts = [] # [新增]
+
             # cand views
             nav_cands = self.scanvp_cands['%s_%s'%(scan, vp)]
             used_viewidxs = set()
             for k, v in nav_cands.items():
                 used_viewidxs.add(v[0])
                 view_img_fts.append(view_fts[v[0]])
+                view_vggt_fts.append(vggt_fts[v[0]]) # [新增]
                 view_angle = self.all_point_rel_angles[12][v[0]]
-                if self.args.correct_heading: 
+                if getattr(self.args, 'correct_heading', False): 
                     heading = cur_heading - view_angle[0] + v[2]
                     elevation = cur_elevation - view_angle[1] + v[3]
                 else:
@@ -746,24 +773,31 @@ class R2RTextPathData(ReverieTextPathData):
                 view_angles.append([heading, elevation])
                 cand_vpids.append(k)
 
-            view_img_fts.extend([view_fts[idx] for idx in range(36) if idx not in used_viewidxs])
-            view_angles.extend([self.all_point_rel_angles[12][idx] for idx in range(36) if idx not in used_viewidxs])
+            # non cand views
+            for idx in range(36):
+                if idx not in used_viewidxs:
+                    view_img_fts.append(view_fts[idx])
+                    view_vggt_fts.append(vggt_fts[idx]) # [新增]
+                    view_angles.append(self.all_point_rel_angles[12][idx])
     
             # combine cand views and noncand views
             view_img_fts = np.stack(view_img_fts, 0)    # (n_views, dim_ft)
+            view_vggt_fts = np.stack(view_vggt_fts, 0)  # [新增] (n_views, 2048)
             view_angles = np.stack(view_angles, 0)
             view_ang_fts = get_angle_fts(view_angles[:, 0], view_angles[:, 1], self.angle_feat_size)
             view_box_fts = np.array([[1, 1, 1]] * len(view_img_fts)).astype(np.float32)
             
             # combine pano features
             traj_view_img_fts.append(view_img_fts)
+            traj_view_vggt_fts.append(view_vggt_fts) # [新增]
             traj_loc_fts.append(np.concatenate([view_ang_fts, view_box_fts], 1))
             traj_nav_types.append([1] * len(cand_vpids) + [0] * (36 - len(used_viewidxs)))
 
             traj_cand_vpids.append(cand_vpids)
             last_vp_angles = view_angles
 
-        return traj_view_img_fts, traj_loc_fts, traj_nav_types, traj_cand_vpids, last_vp_angles
+        # [修改] 返回增加 vggt
+        return traj_view_img_fts, traj_view_vggt_fts, traj_loc_fts, traj_nav_types, traj_cand_vpids, last_vp_angles
 
 
 class SoonTextPathData(ReverieTextPathData):
@@ -773,7 +807,7 @@ class SoonTextPathData(ReverieTextPathData):
         obj_feat_size=None, obj_prob_size=None, max_objects=20,
         max_txt_len=100, in_memory=True, act_visited_node=False,
         cat_file=None, args=None, tok=None,
-        aug_img_db=None
+        aug_img_db=None, vggt_ft_db=None # <--- [新增] 接收
     ):
         super().__init__(
             anno_files, img_ft_db, obj_ft_db, scanvp_cands_file, connectivity_dir,
@@ -783,7 +817,7 @@ class SoonTextPathData(ReverieTextPathData):
             max_txt_len=max_txt_len, in_memory=in_memory,
             act_visited_node=act_visited_node,
             cat_file=cat_file,args=args,tok=tok,
-            aug_img_db=aug_img_db
+            aug_img_db=aug_img_db, vggt_ft_db=vggt_ft_db # <--- [新增] 传递
         )
         self.obj_image_h = self.obj_image_w = 600
         self.obj_image_size = 600 * 600
@@ -812,8 +846,8 @@ def read_img_features_from_h5py(ft_file, img_ft_size=768):
     feature_store = {}
     with h5py.File(ft_file, 'r') as f:
         for key in f.keys():
-            # ft = f[key][...][:, :img_ft_size].astype(np.float32)
-            ft = f[key][...][:, :].astype(np.float32)
+            # 这里恢复原本安全的切片操作。如果你的数据本来就是2048维，[:img_ft_size]会刚好匹配完整数据
+            ft = f[key][...][:, :img_ft_size].astype(np.float32)
             feature_store[key] = ft
     return feature_store
 

@@ -1,9 +1,9 @@
 
-name=goat_r2r_pretrain
+name=goat_r2r_pretrain_vgllm_register
 DATA_ROOT=../datasets/R2R/
 NODE_RANK=0
 NUM_GPUS=1
-
+export NLTK_DATA="/workspace/VLN-GOAT/nltk_data"
 # train
 CUDA_VISIBLE_DEVICES='0' python -m torch.distributed.run \
     --nproc_per_node=${NUM_GPUS} --node_rank $NODE_RANK --master_port 8887 \
