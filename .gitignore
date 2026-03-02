@@ -1,19 +1,36 @@
-.ftpignore
-.ftpconfig
-.vscode
+# env / conda / caches
+conda/
+conda_pkgs/
+pip_cache/
 
-# Byte-compiled / optimized / DLL files
-.ipynb_checkpoints/
+# nltk / language models
+nltk_data/
+en_core_web_sm-2.3.0.tar.gz
+
+# data, large models
+data/
+datasets/
+*.h5
+*.npz
+*.npy
+*.pth
+*.pt
+*.ckpt
+*.tar
+*.tar.gz
+
+# editor / os
 __pycache__/
-*.py[cod]
-*$py.class
-*.swp
+*.pyc
+.ipynb_checkpoints/
+.DS_Store
 
-/datasets
-/notebooks
+# local utility scripts maybe not needed
+get_dataset.py
+get_pretrain_model.py
+get_robaera_instr.py
+verify_vggt.py
 
-*.out
-
-/data
-/connectivity
-/logs
+# any other heavy/generated dir
+map_nav_src/gpu_aviliable.py
+EOF
