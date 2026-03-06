@@ -203,17 +203,59 @@ def main(opts):
     img_ft_db = read_img_features_from_h5py(data_cfg.img_ft_file, model_config.image_feat_size)
     aug_img_db = read_img_features_from_h5py(data_cfg.aug_img_file, model_config.image_feat_size)
 
-    vggt_h5_path = "/workspace/VLN-DUET/data/vggt_features_REGIERS.h5" 
+    # vggt_h5_path = "/workspace/VLN-DUET/data/vggt_features_REGIERS.h5" 
 
-    LOGGER.info(f"Loading VGGT features from {vggt_h5_path} ...")
+    # LOGGER.info(f"Loading VGGT features from {vggt_h5_path} ...")
     vggt_ft_db = None
-    if os.path.exists(vggt_h5_path):
-        # 使用项目自带的 H5PY 读取函数将特征读入内存字典
-        # 第二个参数 2048 是 VGGT 的特征维度
-        # 返回的 vggt_ft_db 是一个字典: {'scanId_viewpointId': numpy_array(36, 2048)}
-        vggt_ft_db = read_img_features_from_h5py(vggt_h5_path, 2048)
+    # if os.path.exists(vggt_h5_path):
+    #     # 使用项目自带的 H5PY 读取函数将特征读入内存字典
+    #     # 第二个参数 2048 是 VGGT 的特征维度
+    #     # 返回的 vggt_ft_db 是一个字典: {'scanId_viewpointId': numpy_array(36, 2048)}
+    #     vggt_ft_db = read_img_features_from_h5py(vggt_h5_path, 2048)
+    # else:
+    #     LOGGER.warning(f"VGGT file not found at {vggt_h5_path}! Training will proceed with ZERO features.")
+
+
+    # === [新增] 加载 Scene Caption ===
+
+    caption_path = "/workspace/VLN-DUET/data/vln_image_captions_roberta.json" # 根据实际路径修改
+    LOGGER.info(f"Loading scene captions from {caption_path} ...")
+    
+    scene_caption_db = None
+    if os.path.exists(caption_path):
+        import json
+        import numpy as np
+        raw_captions = json.load(open(caption_path, 'r'))
+        
+        # 重构成 { "scan_vp": np.array([36, max_len], dtype=np.int64) } 的格式
+        scene_caption_db = {}
+        max_cap_len = 30 # 根据你的数据，通常是30
+        
+        for key, val in raw_captions.items():
+            # key example: "17DRP5sb8fy/00ebbf3782c64d74aaf7dd39cd561175/view_00.jpg"
+            parts = key.split('/')
+            if len(parts) == 3:
+                scan_id = parts[0]
+                vp_id = parts[1]
+                # 提取 view_xx.jpg 中的 xx
+                view_idx = int(parts[2].replace('view_', '').replace('.jpg', ''))
+                
+                scan_vp_key = f"{scan_id}_{vp_id}"
+                
+                if scan_vp_key not in scene_caption_db:
+                    # 初始化一个 36 * max_cap_len 的全0矩阵 (0通常是 padding token)
+                    scene_caption_db[scan_vp_key] = np.zeros((36, max_cap_len), dtype=np.int64)
+                
+                # 取出 roberta_encoding 放入对应行
+                encoding = val.get("roberta_encoding", [])
+                length = min(len(encoding), max_cap_len)
+                scene_caption_db[scan_vp_key][view_idx, :length] = encoding[:length]
+                
+        LOGGER.info(f"Successfully loaded and reshaped captions for {len(scene_caption_db)} viewpoints.")
     else:
-        LOGGER.warning(f"VGGT file not found at {vggt_h5_path}! Training will proceed with ZERO features.")
+        LOGGER.warning(f"Scene Caption file not found at {caption_path}! Will proceed with zero tensors.")
+    # ============================================
+
 
     # Intervention
     z_dicts = None
@@ -240,6 +282,7 @@ def main(opts):
         aug_img_db=aug_img_db,
         z_dicts=z_dicts,
          vggt_ft_db=vggt_ft_db
+        ,scene_caption_db=scene_caption_db # <--- [新增传参]
     )
     val_nav_db = R2RTextPathData(
         data_cfg.val_seen_traj_files, img_ft_db,
@@ -252,7 +295,8 @@ def main(opts):
         args=model_config, tok=tokenizer,
         aug_img_db=aug_img_db,
         z_dicts=z_dicts,
-         vggt_ft_db=vggt_ft_db
+         vggt_ft_db=vggt_ft_db,
+         scene_caption_db=scene_caption_db # <--- [新增传参]
     )
     val2_nav_db = R2RTextPathData(
         data_cfg.val_unseen_traj_files, img_ft_db,
@@ -265,7 +309,8 @@ def main(opts):
         args=model_config, tok=tokenizer,
         aug_img_db=aug_img_db,
         z_dicts=z_dicts,
-         vggt_ft_db=vggt_ft_db
+         vggt_ft_db=vggt_ft_db,
+         scene_caption_db=scene_caption_db # <--- [新增传参]
     )
 
     # Build data loaders

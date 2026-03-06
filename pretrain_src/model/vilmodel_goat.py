@@ -169,82 +169,8 @@ class LanguageEncoderDo(nn.Module):
 
         return txt_embeds
 
-class ImageEmbeddings(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-
-        self.img_linear = nn.Linear(config.image_feat_size, config.hidden_size)
-        self.img_layer_norm = BertLayerNorm(config.hidden_size, eps=1e-12)
-        self.loc_linear = nn.Linear(config.angle_feat_size + 3, config.hidden_size)
-        self.loc_layer_norm = BertLayerNorm(config.hidden_size, eps=1e-12)
-
-        if config.obj_feat_size > 0 and config.obj_feat_size != config.image_feat_size:
-            self.obj_linear = nn.Linear(config.obj_feat_size, config.hidden_size)
-            self.obj_layer_norm = BertLayerNorm(config.hidden_size, eps=1e-12)
-        else:
-            self.obj_linear = self.obj_layer_norm = None
-
-        self.nav_type_embedding = nn.Embedding(3, config.hidden_size)
-
-        # tf naming convention for layer norm
-        self.layer_norm = BertLayerNorm(config.hidden_size, eps=1e-12)
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
-
-        if config.num_pano_layers > 0:
-            self.pano_encoder = create_transformer_encoder(
-                config, config.num_pano_layers, norm=True
-            )
-        else:
-            self.pano_encoder = None
-
-    def forward(
-        self, traj_view_img_fts, traj_obj_img_fts, traj_loc_fts, traj_nav_types, 
-        traj_step_lens, traj_vp_view_lens, traj_vp_obj_lens, type_embed_layer
-    ):
-        device = traj_view_img_fts.device
-        has_obj = traj_obj_img_fts is not None
-
-        traj_view_img_embeds = self.img_layer_norm(self.img_linear(traj_view_img_fts))
-
-        if has_obj:
-            if self.obj_linear is None:
-                traj_obj_img_embeds = self.img_layer_norm(self.img_linear(traj_obj_img_fts))
-            else:
-                traj_obj_img_embeds = self.obj_layer_norm(self.obj_linear(traj_obj_img_fts))
-            traj_img_embeds = []
-            for view_embed, obj_embed, view_len, obj_len in zip(
-                traj_view_img_embeds, traj_obj_img_embeds, traj_vp_view_lens, traj_vp_obj_lens
-            ):
-                if obj_len > 0:
-                    traj_img_embeds.append(torch.cat([view_embed[:view_len], obj_embed[:obj_len]], 0))
-                else:
-                    traj_img_embeds.append(view_embed[:view_len])
-            traj_img_embeds = pad_tensors_wgrad(traj_img_embeds)
-            traj_vp_lens = traj_vp_view_lens + traj_vp_obj_lens
-        else:
-            traj_img_embeds = traj_view_img_embeds
-            traj_vp_lens = traj_vp_view_lens
-
-        traj_embeds = traj_img_embeds + \
-                      self.loc_layer_norm(self.loc_linear(traj_loc_fts)) + \
-                      self.nav_type_embedding(traj_nav_types) + \
-                      type_embed_layer(torch.ones(1, 1).long().to(device))
-        traj_embeds = self.layer_norm(traj_embeds)
-        traj_embeds = self.dropout(traj_embeds)
-
-        traj_masks = gen_seq_masks(traj_vp_lens)
-        if self.pano_encoder is not None:
-            traj_embeds = self.pano_encoder(
-                traj_embeds, src_key_padding_mask=traj_masks.logical_not()
-            )
-
-        split_traj_embeds = torch.split(traj_embeds, traj_step_lens, 0)
-        split_traj_vp_lens = torch.split(traj_vp_lens, traj_step_lens, 0)
-        return split_traj_embeds, split_traj_vp_lens
-    
-
 class CausalImageEmbeddings(nn.Module):
-    ''' Causal learning & VGGT Feature Fusion
+    ''' Causal learning & VGGT Feature Fusion & Scene Caption Fusion
     '''
     def __init__(self, config):
         super().__init__()
@@ -255,11 +181,8 @@ class CausalImageEmbeddings(nn.Module):
         # =====================================================================
         self.vggt_dim = 2048
 
-        # 1) 将每个 VGGT 子向量投影到 hidden_size（共权重）
         self.vggt_proj = nn.Linear(self.vggt_dim, config.hidden_size)
-        # 2) 在 K(=5) 维度上的可学习评分，用于 attention pooling
         self.vggt_pool_score = nn.Linear(config.hidden_size, 1)
-        # 3) 后置小 MLP（可选，但推荐用于进一步融合）
         self.vggt_post_mlp = nn.Sequential(
             nn.Linear(config.hidden_size, config.hidden_size),
             nn.GELU(),
@@ -268,9 +191,18 @@ class CausalImageEmbeddings(nn.Module):
             BertLayerNorm(config.hidden_size, eps=1e-12)
         )
         
-        # 推荐使用更高的 Dropout 比例用于 VGGT 融合（对齐微调）
         dropout_prob = getattr(config, 'feat_dropout', config.hidden_dropout_prob)
         self.vggt_pool_dropout = nn.Dropout(dropout_prob)
+        # =====================================================================
+
+        # =====================================================================
+        # [新增] Scene Caption Cross-Attention 融合层 
+        # =====================================================================
+        import copy
+        tmp_config = copy.deepcopy(config)
+        tmp_config.add_cross_attention = True
+        self.caption_cross_att = BertAttention(tmp_config)
+        self.caption_fusion_norm = BertLayerNorm(config.hidden_size, eps=1e-12)
         # =====================================================================
 
         ''' For interventional image
@@ -312,44 +244,33 @@ class CausalImageEmbeddings(nn.Module):
         else:
             self.nav_type_embedding = nn.Embedding(2, config.hidden_size)
 
-        '''For global map aggregation
-        '''
+        '''For global map aggregation'''
         if config.adaptive_pano_fusion: 
             self.adaptive_pano_attn = nn.Linear(config.hidden_size,1) 
             self.adaptive_pano_act = ACT2FN[config.hidden_act]
             self.adaptive_softmax = nn.Softmax(dim=1)
 
-        # 0: objects, 1: navigable
         self.layer_norm = BertLayerNorm(config.hidden_size, eps=1e-12)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def _fuse_vggt_into_view(self, view_img_embeds, traj_view_vggt_fts):
-        """
-        处理 VGGT 融合，兼容打平的 3D 张量 [N_total, K, 2048] 或原生的 4D 张量 [B, Np, K, 2048]
-        """
         x = traj_view_vggt_fts
         K = x.size(-2)
         D = x.size(-1)
         H = view_img_embeds.size(-1)
 
-        # 把前面所有维度展平
         x_flat = x.view(-1, D)
-        # Project: [N*K, D] -> [N*K, H]
         x_proj = self.vggt_proj(x_flat)
-        # 还原回 [N, K, H]
         x_proj = x_proj.view(-1, K, H)
 
-        # Attention pooling over K
-        scores = self.vggt_pool_score(x_proj).squeeze(-1)  # [N, K]
-        attn = torch.softmax(scores, dim=-1).unsqueeze(-1) # [N, K, 1]
-        pooled = torch.sum(x_proj * attn, dim=-2)          # [N, H]
+        scores = self.vggt_pool_score(x_proj).squeeze(-1)  
+        attn = torch.softmax(scores, dim=-1).unsqueeze(-1) 
+        pooled = torch.sum(x_proj * attn, dim=-2)          
         
         pooled = self.vggt_pool_dropout(pooled)
-        vggt_embeds = self.vggt_post_mlp(pooled)           # [N, H]
+        vggt_embeds = self.vggt_post_mlp(pooled)           
 
-        # 还原回原来的 view_img_embeds 的形状 (保证残差相加合法)
         vggt_embeds = vggt_embeds.view(view_img_embeds.shape)
-
         return view_img_embeds + vggt_embeds
 
     def forward(
@@ -358,38 +279,62 @@ class CausalImageEmbeddings(nn.Module):
         traj_reverie_obj_fts=None, traj_reverie_obj_lens=None,
         traj_reverie_obj_locs=None, 
         z_img_features=None, z_img_pzs=None, traj_reverie_obj_names=None,
-        traj_view_vggt_fts=None # <--- Recieve VGGT
+        traj_view_vggt_fts=None, 
+        scene_caption_embeds=None, 
+        scene_caption_masks=None   
     ):
-        # 1. 基础图像特征映射 (纯 CLIP 空间)
         view_img_embeds = self.img_layer_norm(self.img_linear(traj_view_img_fts))
 
-        # 2. 加入空间位置偏置 (在干预之前对齐预训练设定)
         if self.config.name != 'REVERIE' and self.config.name != 'SOON':
             view_img_embeds = view_img_embeds + self.loc_layer_norm(self.loc_linear(traj_loc_fts))
         
         img_masks = gen_seq_masks(traj_vp_view_lens)
         extended_img_masks = extend_neg_masks(img_masks)
 
-        # 3. 因果特征干预去偏 (在未被污染的纯净 CLIP 空间进行)
         if z_img_features is not None:
-            # Do intervention
             z_img_embeds = self.do_img_layer_norm(self.do_img_before_linear(z_img_features))
             if self.config.z_cross_attn:
                 z_img_embeds = self.do_img_attn(
                     z_img_embeds, 
                     encoder_hidden_states=view_img_embeds, encoder_attention_mask=extended_img_masks)[0]
             p_z_img = z_img_embeds * z_img_pzs.to(torch.float32)
-            sum_z_img = torch.sum(p_z_img,1).unsqueeze(1) #[bs,1,dim]
+            sum_z_img = torch.sum(p_z_img,1).unsqueeze(1) 
             view_img_embeds = self.img_after_linear(view_img_embeds) + self.do_img_after_linear(sum_z_img)
             view_img_embeds = self.do_img_concat_layernorm(view_img_embeds)
 
         # ================= [VGGT 注入点] =================
-        # 4. 在去偏后注入细粒度的 VGGT 特征
-        if traj_view_vggt_fts is not None:
-            view_img_embeds = self._fuse_vggt_into_view(view_img_embeds, traj_view_vggt_fts)
+        # if traj_view_vggt_fts is not None:
+        #     view_img_embeds = self._fuse_vggt_into_view(view_img_embeds, traj_view_vggt_fts)
         # =================================================
 
-        # 5. 上下文自编码聚合
+        # =====================================================================
+        # [新增] 4.5 Scene Caption Cross-Attention 增强
+        # =====================================================================
+        if scene_caption_embeds is not None:
+            S, V, H = view_img_embeds.size()
+            L_cap = scene_caption_embeds.size(2) 
+
+            # Query: 视觉特征 -> 变维为 (S*V, 1, H)
+            visual_query = view_img_embeds.view(S*V, 1, H)
+            
+            # Context: 文本特征 -> (S*V, L_cap, H)
+            caption_context = scene_caption_embeds.view(S*V, L_cap, H)
+            
+            # Mask: -> (S*V, 1, 1, L_cap)
+            caption_masks = scene_caption_masks.view(S*V, 1, 1, L_cap) if scene_caption_masks is not None else None
+            
+            fused_outputs = self.caption_cross_att(
+                hidden_states=visual_query,
+                attention_mask=None,
+                encoder_hidden_states=caption_context,
+                encoder_attention_mask=caption_masks
+            )
+            
+            # 还原形状 (S, V, H)
+            fused_img = fused_outputs[0].view(S, V, H)
+            view_img_embeds = self.caption_fusion_norm(view_img_embeds + fused_img)
+        # =====================================================================
+
         if self.config.name != 'REVERIE' and self.config.name != 'SOON':
             view_img_embeds = self.dropout(view_img_embeds)
             view_img_embeds = self.img_self_encoder(
@@ -788,6 +733,57 @@ class GlocalTextPathCMT(BertPreTrainedModel):
         
         self.init_weights()
 
+    # =================================================================
+    # [修改] 辅助函数：将 Caption IDs 转换为文本 Embeddings (带防显存溢出的 Chunking)
+    # =================================================================
+    def _compute_caption_embeds(self, scene_caption_ids):
+        if scene_caption_ids is None:
+            return None, None
+            
+        S, V, L = scene_caption_ids.size()
+        flat_ids = scene_caption_ids.view(-1, L)
+        flat_masks = (flat_ids != 0).long()
+        
+        # 只做特征提取，切断梯度，避免爆显存
+        with torch.no_grad():
+            token_type_ids = torch.zeros_like(flat_ids)
+            # 获取词嵌入
+            txt_embeds = self.embeddings(flat_ids, token_type_ids=token_type_ids)
+            if type(txt_embeds) is tuple:
+                txt_embeds = txt_embeds[0]
+            
+            # --- 核心改动：Chunking (分批计算)，防止 Transformer 瞬间打爆显存 ---
+            chunk_size = 512 # 每次最多让 512 个句���过 BERT，控制显存开销
+            num_chunks = (flat_ids.size(0) + chunk_size - 1) // chunk_size
+            
+            out_embeds = []
+            for i in range(num_chunks):
+                start_idx = i * chunk_size
+                end_idx = min((i + 1) * chunk_size, flat_ids.size(0))
+                
+                chunk_embeds = txt_embeds[start_idx:end_idx]
+                chunk_masks = flat_masks[start_idx:end_idx]
+                
+                if self.config.do_back_txt:
+                    # 如果用了干预模块，这里取 layer[0] 作为特征 (参照你原本的代码)
+                    res = self.lang_encoder.layer[0](chunk_embeds, extend_neg_masks(chunk_masks))[0]
+                else:
+                    res = self.lang_encoder(chunk_embeds, chunk_masks)
+                    
+                out_embeds.append(res)
+                
+            # 把分批计算的结果重新拼装起来
+            txt_embeds = torch.cat(out_embeds, dim=0)
+            # -----------------------------------------------------------
+            
+        extended_masks = extend_neg_masks(flat_masks)
+        
+        # 恢复维度：(Total_Steps, Max_Views, Cap_Len, Hidden)
+        caption_embeds = txt_embeds.view(S, V, L, -1)
+        caption_masks = extended_masks.view(S, V, 1, 1, L)
+        return caption_embeds, caption_masks
+    # =================================================================
+
     def forward(
         self, txt_ids, txt_lens, traj_view_img_fts, traj_obj_img_fts, traj_loc_fts, traj_nav_types, 
         traj_step_lens, traj_vp_view_lens, traj_vp_obj_lens, traj_vpids, traj_cand_vpids,
@@ -797,7 +793,8 @@ class GlocalTextPathCMT(BertPreTrainedModel):
         traj_reverie_obj_names=None, 
         instr_z_landmark_features=None, instr_z_landmark_pzs=None,
         instr_z_direction_features=None, instr_z_direction_pzs=None,
-        traj_view_vggt_fts=None # <--- [必须添加] 接收 VGGT 参数
+        traj_view_vggt_fts=None, # <--- [接收 VGGT 参数]
+        scene_caption_ids=None   # <--- [新增参数]
     ):        
         # text embedding
         txt_token_type_ids = torch.zeros_like(txt_ids)
@@ -809,14 +806,25 @@ class GlocalTextPathCMT(BertPreTrainedModel):
             txt_embeds = self.embeddings(txt_ids, token_type_ids=txt_token_type_ids)[0]
             txt_embeds = self.lang_encoder(txt_embeds, txt_masks)
         
+        # ================= [新增] 处理 Caption IDs =================
+        if scene_caption_ids is not None:
+            # 直接移到 GPU 并计算，不再需要拆分重组
+            scene_caption_ids = scene_caption_ids.to(txt_ids.device)
+            cap_embeds, cap_masks = self._compute_caption_embeds(scene_caption_ids)
+        else:
+            cap_embeds, cap_masks = None, None
+        # ========================================================
+
         # trajectory embedding
-        # ================= [VGGT 传递点 1] =================
+        # ================= [传递 Caption 与 VGGT] =================
         split_traj_embeds, split_traj_vp_lens, split_traj_fused_embeds = self.img_embeddings(
             traj_view_img_fts, traj_loc_fts, traj_nav_types, 
             traj_step_lens, traj_vp_view_lens, self.embeddings.token_type_embeddings,
             traj_obj_img_fts, traj_vp_obj_lens, traj_reverie_loc_fts,
             z_img_features, z_img_pzs, traj_reverie_obj_names,
-            traj_view_vggt_fts=traj_view_vggt_fts # <--- 传递给视觉融合模块
+            traj_view_vggt_fts=traj_view_vggt_fts,
+            scene_caption_embeds=cap_embeds,
+            scene_caption_masks=cap_masks
         )
         
         # gmap embeds
@@ -837,21 +845,22 @@ class GlocalTextPathCMT(BertPreTrainedModel):
         )
 
         if return_txt_embeds:
-            return gmap_embeds, vp_embeds, txt_embeds
+            return txt_embeds, txt_masks, gmap_embeds, gmap_masks, vp_embeds, vp_masks, split_traj_fused_embeds
         else:
             return gmap_embeds, vp_embeds
 
-    
+
     def forward_mlm(
         self, txt_ids, txt_lens, traj_view_img_fts, traj_obj_img_fts, traj_loc_fts, traj_nav_types, 
         traj_step_lens, traj_vp_view_lens, traj_vp_obj_lens, traj_vpids, traj_cand_vpids,
         gmap_lens, gmap_step_ids, gmap_pos_fts, gmap_pair_dists, gmap_vpids, vp_pos_fts,
-        z_img_features=None, z_img_pzs=None,traj_reverie_loc_fts=None,traj_reverie_obj_names=None,
+        z_img_features=None, z_img_pzs=None, traj_reverie_loc_fts=None,
+        traj_reverie_obj_names=None,
         instr_z_landmark_features=None, instr_z_landmark_pzs=None,
         instr_z_direction_features=None, instr_z_direction_pzs=None,
-        traj_view_vggt_fts=None # <--- [必须添加] 接收 VGGT 参数
+        traj_view_vggt_fts=None, # <--- [接收 VGGT 参数]
+        scene_caption_ids=None   # <--- [新增参数]
     ):
-        # text embedding
         txt_token_type_ids = torch.zeros_like(txt_ids)
         txt_masks = gen_seq_masks(txt_lens)
         if self.config.do_back_txt:
@@ -860,17 +869,27 @@ class GlocalTextPathCMT(BertPreTrainedModel):
         else:
             txt_embeds = self.embeddings(txt_ids, token_type_ids=txt_token_type_ids)[0]
             txt_embeds = self.lang_encoder(txt_embeds, txt_masks)
-        extended_txt_masks = extend_neg_masks(txt_masks)
-        
-        # ================= [VGGT 传递点 2] =================
+
+        # ================= [新增] 处理 Caption IDs =================
+        if scene_caption_ids is not None:
+            scene_caption_ids = scene_caption_ids.to(txt_ids.device)
+            cap_embeds, cap_masks = self._compute_caption_embeds(scene_caption_ids)
+        else:
+            cap_embeds, cap_masks = None, None
+        # ========================================================
+
+        # trajectory embedding
+        # ================= [传递 Caption 与 VGGT] =================
         split_traj_embeds, split_traj_vp_lens, split_traj_fused_embeds = self.img_embeddings(
             traj_view_img_fts, traj_loc_fts, traj_nav_types, 
             traj_step_lens, traj_vp_view_lens, self.embeddings.token_type_embeddings,
             traj_obj_img_fts, traj_vp_obj_lens, traj_reverie_loc_fts,
             z_img_features, z_img_pzs, traj_reverie_obj_names,
-            traj_view_vggt_fts=traj_view_vggt_fts # <--- 传递给视觉融合模块
+            traj_view_vggt_fts=traj_view_vggt_fts,
+            scene_caption_embeds=cap_embeds,
+            scene_caption_masks=cap_masks
         )
-        
+
         # gmap embeds
         gmap_input_embeds, gmap_masks = self.global_encoder.gmap_input_embedding(
             split_traj_embeds, split_traj_vp_lens, traj_vpids, traj_cand_vpids, gmap_vpids,
@@ -880,7 +899,7 @@ class GlocalTextPathCMT(BertPreTrainedModel):
         extended_gmap_masks = extend_neg_masks(gmap_masks)
 
         gmap_txt_embeds = self.global_encoder.encoder(
-            gmap_txt_embeds, extended_txt_masks,
+            gmap_txt_embeds, extend_neg_masks(txt_masks), # fixed to match self-attn input requirement
             gmap_input_embeds, extended_gmap_masks
         )
 
@@ -891,7 +910,7 @@ class GlocalTextPathCMT(BertPreTrainedModel):
         vp_txt_embeds = txt_embeds
         extended_vp_masks = extend_neg_masks(vp_masks)
         vp_txt_embeds = self.local_encoder.encoder(
-            vp_txt_embeds, extended_txt_masks, 
+            vp_txt_embeds, extend_neg_masks(txt_masks), # fixed
             vp_input_embeds, extended_vp_masks,
         )
 
@@ -907,7 +926,8 @@ class GlocalTextPathCMT(BertPreTrainedModel):
         traj_reverie_obj_names=None,
         instr_z_landmark_features=None, instr_z_landmark_pzs=None,
         instr_z_direction_features=None, instr_z_direction_pzs=None,
-        traj_view_vggt_fts=None # <--- [必须添加] 接收 VGGT 参数
+        traj_view_vggt_fts=None, # <--- [接收 VGGT 参数]
+        scene_caption_ids=None   # <--- [新增参数]
     ):        
         # text embedding
         txt_token_type_ids = torch.zeros_like(txt_ids)
@@ -919,14 +939,24 @@ class GlocalTextPathCMT(BertPreTrainedModel):
             txt_embeds = self.embeddings(txt_ids, token_type_ids=txt_token_type_ids)[0]
             txt_embeds = self.lang_encoder(txt_embeds, txt_masks)
         
+        # ================= [新增] 处理 Caption IDs =================
+        if scene_caption_ids is not None:
+            scene_caption_ids = scene_caption_ids.to(txt_ids.device)
+            cap_embeds, cap_masks = self._compute_caption_embeds(scene_caption_ids)
+        else:
+            cap_embeds, cap_masks = None, None
+        # ========================================================
+        
         # trajectory embedding
-        # ================= [VGGT 传递点 3] =================
+        # ================= [传递 Caption 与 VGGT] =================
         split_traj_embeds, split_traj_vp_lens, split_traj_fused_embeds = self.img_embeddings(
             traj_view_img_fts, traj_loc_fts, traj_nav_types, 
             traj_step_lens, traj_vp_view_lens, self.embeddings.token_type_embeddings,
             traj_obj_img_fts, traj_vp_obj_lens, traj_reverie_loc_fts,
             z_img_features, z_img_pzs, traj_reverie_obj_names,
-            traj_view_vggt_fts=traj_view_vggt_fts # <--- 传递给视觉融合模块
+            traj_view_vggt_fts=traj_view_vggt_fts,
+            scene_caption_embeds=cap_embeds,
+            scene_caption_masks=cap_masks
         )
         
         # gmap embeds

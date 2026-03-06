@@ -92,9 +92,9 @@ class GlocalTextPathCMTPreTraining(BertPreTrainedModel):
             if used_rate > 0.9:
                 torch.cuda.empty_cache()
         
-        # [修改] 显式提取 VGGT 特征，避免 defaultdict 导致的问题（虽然这里用了defaultdict，但显式提取更清晰）
         traj_view_vggt_fts = batch.get('traj_view_vggt_fts', None)
-        
+        traj_scene_caption_ids = batch.get('traj_scene_caption_ids', None) # [新增]
+
         batch = defaultdict(lambda: None, batch)
         if task.startswith('mlm'):
             return self.forward_mlm(
@@ -109,7 +109,8 @@ class GlocalTextPathCMTPreTraining(BertPreTrainedModel):
                 batch['instr_z_landmark_features'],batch['instr_z_landmark_pzs'],
                 batch['instr_z_direction_features'],batch['instr_z_direction_pzs'],
                 batch['img_z_features'], batch['img_z_pzs'],
-                traj_view_vggt_fts=traj_view_vggt_fts # <--- [传入]
+                traj_view_vggt_fts=traj_view_vggt_fts,
+                scene_caption_ids=traj_scene_caption_ids # [新增]
             )
         elif task.startswith('mrc'):
             return self.forward_mrc(
@@ -125,7 +126,8 @@ class GlocalTextPathCMTPreTraining(BertPreTrainedModel):
                 batch['instr_z_landmark_features'],batch['instr_z_landmark_pzs'],
                 batch['instr_z_direction_features'],batch['instr_z_direction_pzs'],
                 batch['img_z_features'], batch['img_z_pzs'],
-                traj_view_vggt_fts=traj_view_vggt_fts # <--- [传入]
+                traj_view_vggt_fts=traj_view_vggt_fts,
+                scene_caption_ids=traj_scene_caption_ids # [新增]
             )
         elif task.startswith('sap'):
             return self.forward_sap(
@@ -141,7 +143,8 @@ class GlocalTextPathCMTPreTraining(BertPreTrainedModel):
                 batch['instr_z_landmark_features'],batch['instr_z_landmark_pzs'],
                 batch['instr_z_direction_features'],batch['instr_z_direction_pzs'],
                 batch['img_z_features'], batch['img_z_pzs'],
-                traj_view_vggt_fts=traj_view_vggt_fts # <--- [传入]
+                traj_view_vggt_fts=traj_view_vggt_fts,
+                scene_caption_ids=traj_scene_caption_ids # [新增]
             )
         elif task.startswith('og'):
             return self.forward_og(
@@ -156,7 +159,8 @@ class GlocalTextPathCMTPreTraining(BertPreTrainedModel):
                 batch['instr_z_landmark_features'],batch['instr_z_landmark_pzs'],
                 batch['instr_z_direction_features'],batch['instr_z_direction_pzs'],
                 batch['img_z_features'], batch['img_z_pzs'],
-                traj_view_vggt_fts=traj_view_vggt_fts # <--- [传入]
+                traj_view_vggt_fts=traj_view_vggt_fts,
+                scene_caption_ids=traj_scene_caption_ids # [新增]
             )
         elif task.startswith('valid_sap_og'):
             return self.forward_sap_og(
@@ -172,7 +176,8 @@ class GlocalTextPathCMTPreTraining(BertPreTrainedModel):
                 batch['instr_z_landmark_features'],batch['instr_z_landmark_pzs'],
                 batch['instr_z_direction_features'],batch['instr_z_direction_pzs'],
                 batch['img_z_features'], batch['img_z_pzs'],
-                traj_view_vggt_fts=traj_view_vggt_fts # <--- [传入]
+                traj_view_vggt_fts=traj_view_vggt_fts,
+                scene_caption_ids=traj_scene_caption_ids # [新增]
             )
         elif task.startswith('cfp'):
             return self.forward_cfp(
@@ -188,7 +193,8 @@ class GlocalTextPathCMTPreTraining(BertPreTrainedModel):
                 batch['instr_z_landmark_features'],batch['instr_z_landmark_pzs'],
                 batch['instr_z_direction_features'],batch['instr_z_direction_pzs'],
                 batch['img_z_features'], batch['img_z_pzs'],
-                traj_view_vggt_fts=traj_view_vggt_fts # <--- [传入]
+                traj_view_vggt_fts=traj_view_vggt_fts,
+                scene_caption_ids=traj_scene_caption_ids # [新增]
             )
         else:
             raise ValueError('invalid task')
@@ -202,7 +208,8 @@ class GlocalTextPathCMTPreTraining(BertPreTrainedModel):
         instr_z_landmark_features=None, instr_z_landmark_pzs=None,
         instr_z_direction_features=None, instr_z_direction_pzs=None,
         img_z_fts=None, img_z_pzs=None,
-        traj_view_vggt_fts=None # <--- [新增参数]
+        traj_view_vggt_fts=None,
+        scene_caption_ids=None # [新增]
     ):
         txt_embeds = self.bert.forward_mlm(
             txt_ids, txt_lens, traj_view_img_fts, traj_obj_img_fts, traj_loc_fts, traj_nav_types, 
@@ -212,10 +219,10 @@ class GlocalTextPathCMTPreTraining(BertPreTrainedModel):
             instr_z_landmark_features=instr_z_landmark_features, instr_z_landmark_pzs=instr_z_landmark_pzs,
             instr_z_direction_features=instr_z_direction_features, instr_z_direction_pzs=instr_z_direction_pzs,
             z_img_features=img_z_fts, z_img_pzs=img_z_pzs,
-            traj_view_vggt_fts=traj_view_vggt_fts # <--- [传入]
+            traj_view_vggt_fts=traj_view_vggt_fts,
+            scene_caption_ids=scene_caption_ids # [新增]
         )
 
-        # only compute masked tokens for better efficiency
         masked_output = self._compute_masked_hidden(txt_embeds, txt_labels != -1)
         prediction_scores = self.mlm_head(masked_output)
 
@@ -228,7 +235,6 @@ class GlocalTextPathCMTPreTraining(BertPreTrainedModel):
             return prediction_scores
 
     def _compute_masked_hidden(self, hidden, mask):
-        '''get only the masked region (don't compute unnecessary hiddens)'''
         mask = mask.unsqueeze(-1).expand_as(hidden)
         hidden_masked = hidden[mask].contiguous().view(-1, hidden.size(-1))
         return hidden_masked
@@ -242,7 +248,8 @@ class GlocalTextPathCMTPreTraining(BertPreTrainedModel):
         instr_z_landmark_features=None, instr_z_landmark_pzs=None,
         instr_z_direction_features=None, instr_z_direction_pzs=None,
         img_z_fts=None, img_z_pzs=None,
-        traj_view_vggt_fts=None # <--- [新增参数]
+        traj_view_vggt_fts=None,
+        scene_caption_ids=None # [新增]
     ):
         _, vp_embeds = self.bert(
             txt_ids, txt_lens, traj_view_img_fts, traj_obj_img_fts, traj_loc_fts, traj_nav_types, 
@@ -253,16 +260,15 @@ class GlocalTextPathCMTPreTraining(BertPreTrainedModel):
             instr_z_landmark_features=instr_z_landmark_features, instr_z_landmark_pzs=instr_z_landmark_pzs,
             instr_z_direction_features=instr_z_direction_features, instr_z_direction_pzs=instr_z_direction_pzs,
             z_img_features=img_z_fts, z_img_pzs=img_z_pzs,
-            traj_view_vggt_fts=traj_view_vggt_fts # <--- [传入]
+            traj_view_vggt_fts=traj_view_vggt_fts,
+            scene_caption_ids=scene_caption_ids # [新增]
         )
         
         vp_view_lens = [x[-1] for x in torch.split(traj_vp_view_lens, traj_step_lens)]
         vp_view_embeds = pad_tensors_wgrad(
             [x[1:view_len+1] for x, view_len in zip(vp_embeds, vp_view_lens)]
-        )   # [stop] at 0
-        # vp_view_mrc_masks = vp_view_mrc_masks[:, :vp_view_embeds.size(1)]
+        )   
         
-        # only compute masked regions for better efficient=cy
         view_masked_output = self._compute_masked_hidden(vp_view_embeds, vp_view_mrc_masks)
         view_prediction_soft_labels = self.image_classifier(view_masked_output)
         view_mrc_targets = self._compute_masked_hidden(vp_view_probs, vp_view_mrc_masks)
@@ -272,7 +278,6 @@ class GlocalTextPathCMTPreTraining(BertPreTrainedModel):
             vp_obj_embeds = pad_tensors_wgrad(
                 [x[view_len+1:view_len+obj_len+1] for x, view_len, obj_len in zip(vp_embeds, vp_view_lens, vp_obj_lens)]
             )
-            # vp_obj_mrc_masks = vp_obj_mrc_masks[:, :vp_obj_embeds.size(1)]
             obj_masked_output = self._compute_masked_hidden(vp_obj_embeds, vp_obj_mrc_masks)
             if self.obj_classifier is None:
                 obj_prediction_soft_labels = self.image_classifier(obj_masked_output)
@@ -304,7 +309,8 @@ class GlocalTextPathCMTPreTraining(BertPreTrainedModel):
         instr_z_landmark_features=None, instr_z_landmark_pzs=None,
         instr_z_direction_features=None, instr_z_direction_pzs=None,
         img_z_fts=None, img_z_pzs=None,
-        traj_view_vggt_fts=None # <--- [新增参数]
+        traj_view_vggt_fts=None,
+        scene_caption_ids=None # [新增]
     ):
         batch_size = txt_ids.size(0)
 
@@ -316,7 +322,8 @@ class GlocalTextPathCMTPreTraining(BertPreTrainedModel):
             instr_z_landmark_features=instr_z_landmark_features, instr_z_landmark_pzs=instr_z_landmark_pzs,
             instr_z_direction_features=instr_z_direction_features, instr_z_direction_pzs=instr_z_direction_pzs,
             z_img_features=img_z_fts, z_img_pzs=img_z_pzs,
-            traj_view_vggt_fts=traj_view_vggt_fts # <--- [传入]
+            traj_view_vggt_fts=traj_view_vggt_fts,
+            scene_caption_ids=scene_caption_ids # [新增]
         )
         
         if self.sap_fuse_linear is None:
@@ -358,7 +365,7 @@ class GlocalTextPathCMTPreTraining(BertPreTrainedModel):
                     else:
                         fused_logits[i, j] += bw_logits
 
-        if compute_loss: # Default: True
+        if compute_loss: 
             global_losses = F.cross_entropy(global_logits, global_act_labels, reduction='none')
             local_losses = F.cross_entropy(local_logits, local_act_labels, reduction='none')
             fused_losses = F.cross_entropy(fused_logits, global_act_labels, reduction='none')
@@ -376,7 +383,8 @@ class GlocalTextPathCMTPreTraining(BertPreTrainedModel):
         instr_z_landmark_features=None, instr_z_landmark_pzs=None,
         instr_z_direction_features=None, instr_z_direction_pzs=None,
         img_z_fts=None, img_z_pzs=None,
-        traj_view_vggt_fts=None # <--- [新增参数]
+        traj_view_vggt_fts=None,
+        scene_caption_ids=None # [新增]
     ):
         gmap_embeds, vp_embeds = self.bert.forward(
             txt_ids, txt_lens, traj_view_img_fts, traj_obj_img_fts, traj_loc_fts, traj_nav_types, 
@@ -387,7 +395,8 @@ class GlocalTextPathCMTPreTraining(BertPreTrainedModel):
             instr_z_landmark_features=instr_z_landmark_features, instr_z_landmark_pzs=instr_z_landmark_pzs,
             instr_z_direction_features=instr_z_direction_features, instr_z_direction_pzs=instr_z_direction_pzs,
             z_img_features=img_z_fts, z_img_pzs=img_z_pzs,
-            traj_view_vggt_fts=traj_view_vggt_fts # <--- [传入]
+            traj_view_vggt_fts=traj_view_vggt_fts,
+            scene_caption_ids=scene_caption_ids # [新增]
         )
 
         vp_view_lens = [x[-1] for x in torch.split(traj_vp_view_lens, traj_step_lens, 0)]
@@ -410,12 +419,14 @@ class GlocalTextPathCMTPreTraining(BertPreTrainedModel):
         self, txt_ids, txt_lens, traj_view_img_fts, traj_obj_img_fts, traj_loc_fts, traj_nav_types, 
         traj_step_lens, traj_vp_view_lens, traj_vp_obj_lens, traj_vpids, traj_cand_vpids,
         gmap_lens, gmap_step_ids, gmap_pos_fts, gmap_pair_dists, gmap_vpids, vp_pos_fts,
-        gmap_visited_masks,
+        gmap_visited_masks, global_act_labels, local_act_labels, 
+        obj_labels,
         traj_reverie_loc_fts=None,traj_reverie_obj_names=None,
         instr_z_landmark_features=None, instr_z_landmark_pzs=None,
         instr_z_direction_features=None, instr_z_direction_pzs=None,
         img_z_fts=None, img_z_pzs=None,
-        traj_view_vggt_fts=None # <--- [新增参数]
+        traj_view_vggt_fts=None,
+        scene_caption_ids=None # [新增]
     ):
         batch_size = txt_ids.size(0)
 
@@ -427,7 +438,8 @@ class GlocalTextPathCMTPreTraining(BertPreTrainedModel):
             instr_z_landmark_features=instr_z_landmark_features, instr_z_landmark_pzs=instr_z_landmark_pzs,
             instr_z_direction_features=instr_z_direction_features, instr_z_direction_pzs=instr_z_direction_pzs,
             z_img_features=img_z_fts, z_img_pzs=img_z_pzs,
-            traj_view_vggt_fts=traj_view_vggt_fts # <--- [传入]
+            traj_view_vggt_fts=traj_view_vggt_fts,
+            scene_caption_ids=scene_caption_ids # [新增]
         )
         
         if self.sap_fuse_linear is None:
@@ -491,7 +503,8 @@ class GlocalTextPathCMTPreTraining(BertPreTrainedModel):
         instr_z_landmark_features=None, instr_z_landmark_pzs=None,
         instr_z_direction_features=None, instr_z_direction_pzs=None,
         img_z_fts=None, img_z_pzs=None,
-        traj_view_vggt_fts=None # <--- [新增参数]
+        traj_view_vggt_fts=None,
+        scene_caption_ids=None # [新增]
     ):
         batch_size = txt_ids.size(0)
 
@@ -504,7 +517,8 @@ class GlocalTextPathCMTPreTraining(BertPreTrainedModel):
             instr_z_landmark_features=instr_z_landmark_features, instr_z_landmark_pzs=instr_z_landmark_pzs,
             instr_z_direction_features=instr_z_direction_features, instr_z_direction_pzs=instr_z_direction_pzs,
             z_img_features=img_z_fts, z_img_pzs=img_z_pzs,
-            traj_view_vggt_fts=traj_view_vggt_fts # <--- [传入]
+            traj_view_vggt_fts=traj_view_vggt_fts,
+            scene_caption_ids=scene_caption_ids # [新增]
         ) 
         if extra_heads:
             gmap_embeds = self.tim_global_head(gmap_embeds)
@@ -558,4 +572,4 @@ class GlocalTextPathCMTPreTraining(BertPreTrainedModel):
             return losses
         
         else:
-            return gmap_outputs, vp_outputs, fused_outputs, txt_outputs 
+            return gmap_outputs, vp_outputs, fused_outputs, txt_outputs
