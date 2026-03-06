@@ -110,6 +110,9 @@ class MlmDataset(Dataset):
         
         # [新增] 读取 VGGT 特征
         output['traj_view_vggt_fts'] = [torch.from_numpy(x) for x in inputs['traj_view_vggt_fts']]
+        # [新增] 将 Scene Caption 转换为 Tensor
+        if 'traj_scene_caption_ids' in inputs:
+            output['traj_scene_caption_ids'] = [torch.from_numpy(x) for x in inputs['traj_scene_caption_ids']]
 
         if 'traj_obj_img_fts' in inputs:
             output['traj_obj_img_fts'] = [torch.from_numpy(x) for x in inputs['traj_obj_img_fts']]  
@@ -177,6 +180,20 @@ def mlm_collate(inputs):
             batch['traj_reverie_loc_fts'] = None
     else:
         batch['traj_reverie_loc_fts'] = None
+
+        # ======================================================================
+    # [新增] 在 collate_fn 中展平并 Padding Caption IDs
+    if 'traj_scene_caption_ids' in batch and batch['traj_scene_caption_ids'][0] is not None:
+        # 和 traj_view_img_fts 一样，用 sum(..., []) 展平所有的 steps，然后变成 Tensor 再进行 pad
+        flat_captions = sum(batch['traj_scene_caption_ids'], [])
+        batch['traj_scene_caption_ids'] = pad_tensors([
+    x.clone().detach().to(torch.long) if isinstance(x, torch.Tensor) else torch.tensor(x, dtype=torch.long) 
+    for x in flat_captions
+])
+    else:
+        batch['traj_scene_caption_ids'] = None
+    # ======================================================================
+
 
     # gmap batches: gmap_vpids
     batch['gmap_lens'] = torch.LongTensor([len(x) for x in batch['gmap_step_ids']]) # included [stop]
@@ -267,6 +284,10 @@ class MrcDataset(Dataset):
         # [新增] 对 VGGT 特征应用完全相同的 Mask (防止几何信息泄漏)
         output['traj_view_vggt_fts'][-1] = _mask_img_feat(output['traj_view_vggt_fts'][-1], view_mrc_masks)
 
+        # [新增]
+        if 'traj_scene_caption_ids' in inputs:
+            output['traj_scene_caption_ids'] = [torch.from_numpy(x) for x in inputs['traj_scene_caption_ids']]
+
         output['vp_view_probs'] = torch.from_numpy(inputs['vp_view_probs']) # no [stop]
         output['vp_view_mrc_masks'] = view_mrc_masks
         output['traj_loc_fts'] = [torch.from_numpy(x) for x in inputs['traj_loc_fts']]
@@ -315,6 +336,19 @@ def mrc_collate(inputs):
     # text batches
     batch['txt_lens'] = torch.LongTensor([len(x) for x in batch['txt_ids']])
     batch['txt_ids'] = pad_sequence(batch['txt_ids'], batch_first=True, padding_value=0)
+
+        # ======================================================================
+    # [新增] 在 collate_fn 中展平并 Padding Caption IDs
+    if 'traj_scene_caption_ids' in batch and batch['traj_scene_caption_ids'][0] is not None:
+        # 和 traj_view_img_fts 一样，用 sum(..., []) 展平所有的 steps，然后变成 Tensor 再进行 pad
+        flat_captions = sum(batch['traj_scene_caption_ids'], [])
+        batch['traj_scene_caption_ids'] = pad_tensors([
+    x.clone().detach().to(torch.long) if isinstance(x, torch.Tensor) else torch.tensor(x, dtype=torch.long) 
+    for x in flat_captions
+])
+    else:
+        batch['traj_scene_caption_ids'] = None
+    # ======================================================================
 
     # trajectory batches: traj_cand_vpids, traj_vpids
     batch['traj_step_lens'] = [len(x) for x in batch['traj_view_img_fts']]
@@ -437,6 +471,9 @@ class SapDataset(Dataset):
         output['local_act_labels'] = inputs['local_act_labels']
         output['global_act_labels'] = inputs['global_act_labels']
 
+        if 'traj_scene_caption_ids' in inputs:
+            output['traj_scene_caption_ids'] = [torch.from_numpy(x) for x in inputs['traj_scene_caption_ids']]
+
         if 'instr_z_direction_features' in inputs.keys():
             output['instr_z_direction_features'] = inputs['instr_z_direction_features']
             output['instr_z_direction_pzs'] = inputs['instr_z_direction_pzs']
@@ -455,6 +492,19 @@ def sap_collate(inputs):
     # text batches
     batch['txt_lens'] = torch.LongTensor([len(x) for x in batch['txt_ids']])
     batch['txt_ids'] = pad_sequence(batch['txt_ids'], batch_first=True, padding_value=0)
+
+        # ======================================================================
+    # [新增] 在 collate_fn 中展平并 Padding Caption IDs
+    if 'traj_scene_caption_ids' in batch and batch['traj_scene_caption_ids'][0] is not None:
+        # 和 traj_view_img_fts 一样，用 sum(..., []) 展平所有的 steps，然后变成 Tensor 再进行 pad
+        flat_captions = sum(batch['traj_scene_caption_ids'], [])
+        batch['traj_scene_caption_ids'] = pad_tensors([
+    x.clone().detach().to(torch.long) if isinstance(x, torch.Tensor) else torch.tensor(x, dtype=torch.long) 
+    for x in flat_captions
+])
+    else:
+        batch['traj_scene_caption_ids'] = None
+    # ======================================================================
 
     # trajectory batches: traj_cand_vpids, traj_vpids
     batch['traj_step_lens'] = [len(x) for x in batch['traj_view_img_fts']]
@@ -537,6 +587,8 @@ class OGDataset(Dataset):
         
         # [新增] 读取 VGGT 特征
         output['traj_view_vggt_fts'] = [torch.from_numpy(x) for x in inputs['traj_view_vggt_fts']]
+        if 'traj_scene_caption_ids' in inputs:
+            output['traj_scene_caption_ids'] = [torch.from_numpy(x) for x in inputs['traj_scene_caption_ids']]
 
         output['traj_obj_img_fts'] = [torch.from_numpy(x) for x in inputs['traj_obj_img_fts']]
         output['traj_loc_fts'] = [torch.from_numpy(x) for x in inputs['traj_loc_fts']]
@@ -567,6 +619,7 @@ class OGDataset(Dataset):
 
             output['img_z_features'] = inputs['img_z_features']
             output['img_z_pzs'] = inputs['img_z_pzs']
+            
 
         return output
 
@@ -577,6 +630,21 @@ def og_collate(inputs):
     # text batches
     batch['txt_lens'] = torch.LongTensor([len(x) for x in batch['txt_ids']])
     batch['txt_ids'] = pad_sequence(batch['txt_ids'], batch_first=True, padding_value=0)
+
+
+        # ======================================================================
+    # [新增] 在 collate_fn 中展平并 Padding Caption IDs
+    if 'traj_scene_caption_ids' in batch and batch['traj_scene_caption_ids'][0] is not None:
+        # 和 traj_view_img_fts 一样，用 sum(..., []) 展平所有的 steps，然后变成 Tensor 再进行 pad
+        flat_captions = sum(batch['traj_scene_caption_ids'], [])
+        batch['traj_scene_caption_ids'] = pad_tensors([
+    x.clone().detach().to(torch.long) if isinstance(x, torch.Tensor) else torch.tensor(x, dtype=torch.long) 
+    for x in flat_captions
+])
+    else:
+        batch['traj_scene_caption_ids'] = None
+    # ======================================================================
+
 
     # trajectory batches: traj_cand_vpids, traj_vpids
     batch['traj_step_lens'] = [len(x) for x in batch['traj_view_img_fts']]
@@ -703,6 +771,19 @@ def cfp_collate(inputs):
     # text batches
     batch['txt_lens'] = torch.LongTensor([len(x) for x in batch['txt_ids']])
     batch['txt_ids'] = pad_sequence(batch['txt_ids'], batch_first=True, padding_value=0)
+
+        # ======================================================================
+    # [新增] 在 collate_fn 中展平并 Padding Caption IDs
+    if 'traj_scene_caption_ids' in batch and batch['traj_scene_caption_ids'][0] is not None:
+        # 和 traj_view_img_fts 一样，用 sum(..., []) 展平所有的 steps，然后变成 Tensor 再进行 pad
+        flat_captions = sum(batch['traj_scene_caption_ids'], [])
+        batch['traj_scene_caption_ids'] = pad_tensors([
+    x.clone().detach().to(torch.long) if isinstance(x, torch.Tensor) else torch.tensor(x, dtype=torch.long) 
+    for x in flat_captions
+]) 
+    else:
+        batch['traj_scene_caption_ids'] = None
+    # ======================================================================
 
     # trajectory batches: traj_cand_vpids, traj_vpids
     batch['traj_step_lens'] = [len(x) for x in batch['traj_view_img_fts']]

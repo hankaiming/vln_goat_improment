@@ -27,7 +27,7 @@ class EnvBatch(object):
     ''' A simple wrapper for a batch of MatterSim environments,
         using discretized viewpoints and pretrained features '''
 
-    def __init__(self, args, connectivity_dir, scan_data_dir=None, feat_db=None, vggt_db=None, batch_size=100):
+    def __init__(self, args, connectivity_dir, scan_data_dir=None, feat_db=None, vggt_db=None, scene_caption_db=None, batch_size=100):
         """
         1. Load pretrained image feature
         2. Init the Simulator.
@@ -36,6 +36,7 @@ class EnvBatch(object):
         """
         self.args = args
         self.vggt_db = vggt_db
+        self.scene_caption_db = scene_caption_db # <--- [新增] 
         self.aug_feat_db = None
         if type(feat_db) is list:
             self.aug_feat_db = feat_db
