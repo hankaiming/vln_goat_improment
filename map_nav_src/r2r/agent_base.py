@@ -17,6 +17,7 @@ from transformers import get_scheduler
 from utils.distributed import is_default_gpu
 from utils.logger import print_progress
 from utils.data import PickSpecificWords
+
 # 初始化 logger
 logger = logging.getLogger(__name__)
 class BaseAgent(object):

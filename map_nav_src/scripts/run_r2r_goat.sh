@@ -1,16 +1,25 @@
-name=goat_r2r
+name=r2r_vgllm_register_afterbackcasual
+
 DATA_ROOT=../datasets
+export NLTK_DATA="/workspace/VLN-GOAT/nltk_data"
+# ==================== [路径配置] ====================
+# 1. 预训练模型路径 (Pre-training 产出的 best_model.pt)
+# 请务必确认这个路径和你上一步提取特征时用的一样
+r2r_pretrain_file=${DATA_ROOT}/R2R/pretrain/goat_r2r_pretrain_vgllm_register/ckpts/model_step_best.pt
+# 2. CFP 特征文件路径 (你刚刚训练出来的，如果R2R不需要可以注释掉flag里的--front_feat_file)
+# 直接填你提供的路径 (如无指定可留空)
+cfp_features_file=
+# ====================================================
 
 train_alg=dagger
-ft_dim=768
 features=clip768
+ft_dim=768
 ngpus=1
 seed=0
 
-outdir=${DATA_ROOT}/R2R/
+outdir=${DATA_ROOT}/R2R/fintune/vggllm_register_add/
 aug_file=${DATA_ROOT}/R2R/annotations/prevalent_aug_train_enc.json
 speaker_file=${DATA_ROOT}/R2R/speaker/transpeaker_r2r/state_dict/best_both_bleu.pt
-r2r_pretrain_file=${DATA_ROOT}/R2R/pretrain/goat_r2r_pretrain/ckpts/model_step_best_42000.pt
 
 flag="--root_dir ${DATA_ROOT}
       --dataset r2r
@@ -18,8 +27,8 @@ flag="--root_dir ${DATA_ROOT}
       --world_size ${ngpus}
       --seed ${seed}
       --tokenizer roberta
-      --name ${name}   
       --mode train
+      --name ${name}
 
       --enc_full_graph
       --graph_sprels
@@ -35,7 +44,7 @@ flag="--root_dir ${DATA_ROOT}
       --max_action_len 15
       --max_instr_len 200
 
-      --batch_size 12
+      --batch_size 6
       --lr 2e-5
       --iters 150000
       --log_every 1000
@@ -45,15 +54,15 @@ flag="--root_dir ${DATA_ROOT}
       --image_feat_size ${ft_dim}
       --angle_feat_size 4
 
-      --ml_weight 0.2 
+      --ml_weight 0.2
 
       --feat_dropout 0.5
       --dropout 0.1
 
       --use_transpeaker
-      --speaker ${speaker_file}
       --accumulateGrad
       --aug ${aug_file}
+      --speaker ${speaker_file}
 
       --do_back_txt
       --do_back_img
@@ -65,8 +74,13 @@ flag="--root_dir ${DATA_ROOT}
       --do_front_txt
       --do_front_img
       --do_front_his
+      --front_feat_file ${cfp_features_file}
       "
 
-# train
-CUDA_VISIBLE_DEVICES='0' python r2r/main_nav.py $flag  \
-      --bert_ckpt_file ${r2r_pretrain_file}
+# ==================== [关键修改] ====================
+# 1. 使用 --resume_file 加载预训练权重 (Pre-train)
+# 2. 删除了 --bert_ckpt_file 以避免 IsADirectoryError 报错
+# 3. 脚本 flag 中已经加入了 --front_feat_file 来读取 CFP 特征
+CUDA_VISIBLE_DEVICES='0' python -u r2r/main_nav.py $flag \
+      --resume_file ${r2r_pretrain_file}
+# ====================================================

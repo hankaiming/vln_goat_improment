@@ -255,7 +255,7 @@ class CausalImageEmbeddings(nn.Module):
         # =====================================================================
         self.vggt_dim = 2048
 
-        # 1) 将每个 VGGT 子向量投影到 hidden_size（共���权重）
+        # 1) 将每个 VGGT 子向量投影到 hidden_size（共权重）
         self.vggt_proj = nn.Linear(self.vggt_dim, config.hidden_size)
         # 2) 在 K(=5) 维度上的可学习评分，用于 attention pooling
         self.vggt_pool_score = nn.Linear(config.hidden_size, 1)
@@ -267,7 +267,10 @@ class CausalImageEmbeddings(nn.Module):
             nn.Linear(config.hidden_size, config.hidden_size),
             BertLayerNorm(config.hidden_size, eps=1e-12)
         )
-        self.vggt_pool_dropout = nn.Dropout(config.hidden_dropout_prob)
+        
+        # 推荐使用更高的 Dropout 比例用于 VGGT 融合（对齐微调）
+        dropout_prob = getattr(config, 'feat_dropout', config.hidden_dropout_prob)
+        self.vggt_pool_dropout = nn.Dropout(dropout_prob)
         # =====================================================================
 
         ''' For interventional image
@@ -320,7 +323,35 @@ class CausalImageEmbeddings(nn.Module):
         self.layer_norm = BertLayerNorm(config.hidden_size, eps=1e-12)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
+    def _fuse_vggt_into_view(self, view_img_embeds, traj_view_vggt_fts):
+        """
+        处理 VGGT 融合，兼容打平的 3D 张量 [N_total, K, 2048] 或原生的 4D 张量 [B, Np, K, 2048]
+        """
+        x = traj_view_vggt_fts
+        K = x.size(-2)
+        D = x.size(-1)
+        H = view_img_embeds.size(-1)
+
+        # 把前面所有维度展平
+        x_flat = x.view(-1, D)
+        # Project: [N*K, D] -> [N*K, H]
+        x_proj = self.vggt_proj(x_flat)
+        # 还原回 [N, K, H]
+        x_proj = x_proj.view(-1, K, H)
+
+        # Attention pooling over K
+        scores = self.vggt_pool_score(x_proj).squeeze(-1)  # [N, K]
+        attn = torch.softmax(scores, dim=-1).unsqueeze(-1) # [N, K, 1]
+        pooled = torch.sum(x_proj * attn, dim=-2)          # [N, H]
         
+        pooled = self.vggt_pool_dropout(pooled)
+        vggt_embeds = self.vggt_post_mlp(pooled)           # [N, H]
+
+        # 还原回原来的 view_img_embeds 的形状 (保证残差相加合法)
+        vggt_embeds = vggt_embeds.view(view_img_embeds.shape)
+
+        return view_img_embeds + vggt_embeds
+
     def forward(
         self, traj_view_img_fts, traj_loc_fts, traj_nav_types, 
         traj_step_lens, traj_vp_view_lens, type_embed_layer, 
@@ -329,51 +360,17 @@ class CausalImageEmbeddings(nn.Module):
         z_img_features=None, z_img_pzs=None, traj_reverie_obj_names=None,
         traj_view_vggt_fts=None # <--- Recieve VGGT
     ):
-        # traj_view_img_fts: [B, Np, image_feat_size]  (可能 B==sum_steps)
-        # traj_view_vggt_fts: expected [B, Np, K, 2048] where K=5
+        # 1. 基础图像特征映射 (纯 CLIP 空间)
         view_img_embeds = self.img_layer_norm(self.img_linear(traj_view_img_fts))
 
-        # =====================================================================
-        # VGGT: attention pooling on K dim -> project/MLP -> residual add
-        # =====================================================================
-        if traj_view_vggt_fts is not None:
-            x = traj_view_vggt_fts
-            if x.dim() != 4:
-                raise RuntimeError(f"traj_view_vggt_fts expected 4D tensor [B,Np,K,2048], got {x.shape}")
-
-            B, Np, K, D = x.shape
-            # project each sub-vector -> [B, Np, K, H]
-            x_proj = self.vggt_proj(x.view(B * Np * K, D))  # [B*Np*K, H]
-            x_proj = x_proj.view(B, Np, K, -1)              # [B, Np, K, H]
-
-            # attention pooling over K
-            scores = self.vggt_pool_score(x_proj).squeeze(-1)  # [B, Np, K]
-            attn = torch.softmax(scores, dim=-1).unsqueeze(-1) # [B, Np, K, 1]
-            pooled = torch.sum(x_proj * attn, dim=2)          # [B, Np, H]
-            pooled = self.vggt_pool_dropout(pooled)
-
-            # optional small MLP
-            vggt_embeds = self.vggt_post_mlp(pooled)          # [B, Np, H]
-
-            # ensure dtype/device compatibility
-            if vggt_embeds.dtype != view_img_embeds.dtype:
-                vggt_embeds = vggt_embeds.to(view_img_embeds.dtype)
-            if vggt_embeds.device != view_img_embeds.device:
-                vggt_embeds = vggt_embeds.to(view_img_embeds.device)
-
-            # residual add: require shapes match
-            if view_img_embeds.shape != vggt_embeds.shape:
-                # try to be informative rather than silently broadcasting
-                raise RuntimeError(f"shape mismatch when fusing vggt: view_img_embeds {view_img_embeds.shape} vs vggt_embeds {vggt_embeds.shape}")
-            view_img_embeds = view_img_embeds + vggt_embeds
-        # =====================================================================
-
+        # 2. 加入空间位置偏置 (在干预之前对齐预训练设定)
         if self.config.name != 'REVERIE' and self.config.name != 'SOON':
             view_img_embeds = view_img_embeds + self.loc_layer_norm(self.loc_linear(traj_loc_fts))
         
         img_masks = gen_seq_masks(traj_vp_view_lens)
         extended_img_masks = extend_neg_masks(img_masks)
 
+        # 3. 因果特征干预去偏 (在未被污染的纯净 CLIP 空间进行)
         if z_img_features is not None:
             # Do intervention
             z_img_embeds = self.do_img_layer_norm(self.do_img_before_linear(z_img_features))
@@ -386,6 +383,13 @@ class CausalImageEmbeddings(nn.Module):
             view_img_embeds = self.img_after_linear(view_img_embeds) + self.do_img_after_linear(sum_z_img)
             view_img_embeds = self.do_img_concat_layernorm(view_img_embeds)
 
+        # ================= [VGGT 注入点] =================
+        # 4. 在去偏后注入细粒度的 VGGT 特征
+        if traj_view_vggt_fts is not None:
+            view_img_embeds = self._fuse_vggt_into_view(view_img_embeds, traj_view_vggt_fts)
+        # =================================================
+
+        # 5. 上下文自编码聚合
         if self.config.name != 'REVERIE' and self.config.name != 'SOON':
             view_img_embeds = self.dropout(view_img_embeds)
             view_img_embeds = self.img_self_encoder(

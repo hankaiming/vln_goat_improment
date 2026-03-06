@@ -99,7 +99,8 @@ def build_dataset(args, rank=0):
             aug_feat_db, aug_instr_data, args.connectivity_dir, 
             batch_size=args.batch_size, angle_feat_size=args.angle_feat_size, 
             seed=args.seed+rank, sel_data_idxs=None, name='aug', 
-            args=args, scanvp_cands_file=args.scanvp_cands_file
+            args=args, scanvp_cands_file=args.scanvp_cands_file,
+            vggt_db=vggt_db  # <--- [新增] 传入 vggt_db
         )
     else:
         aug_env = None
@@ -115,7 +116,8 @@ def build_dataset(args, rank=0):
         batch_size=args.batch_size, 
         angle_feat_size=args.angle_feat_size, seed=args.seed+rank,
         sel_data_idxs=None, name='train', 
-        args=args, scanvp_cands_file=args.scanvp_cands_file
+        args=args, scanvp_cands_file=args.scanvp_cands_file,
+        vggt_db=vggt_db  # <--- [新增] 传入 vggt_db
     )
 
     val_env_names = ['val_train_seen', 'val_seen', 'val_unseen']
@@ -138,7 +140,8 @@ def build_dataset(args, rank=0):
             feat_db, val_instr_data, args.connectivity_dir, batch_size=args.batch_size, 
             angle_feat_size=args.angle_feat_size, seed=args.seed+rank,
             sel_data_idxs=None if args.world_size < 2 else (rank, args.world_size), name=split,
-            args=args, scanvp_cands_file=args.scanvp_cands_file
+            args=args, scanvp_cands_file=args.scanvp_cands_file,
+            vggt_db=vggt_db  # <--- [新增] 传入 vggt_db
         )  
         val_envs[split] = val_env
 

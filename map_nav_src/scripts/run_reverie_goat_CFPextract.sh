@@ -55,7 +55,7 @@
 # CUDA_VISIBLE_DEVICES='1' python -u reverie/main_nav_obj.py $flag  \
 #       --bert_ckpt_file ${reverie_pretrain_file}
 
-name=reverie_goat_cfp_vgllm_add_vggtadd
+name=reverie_goat_cfp_vgllm_add_vggtaddregister20w
 DATA_ROOT=../datasets
 export NLTK_DATA="/workspace/VLN-GOAT/nltk_data"
 train_alg=dagger
@@ -67,11 +67,11 @@ obj_ft_dim=768
 ngpus=1
 seed=0
 
-outdir=${DATA_ROOT}/REVERIE/
+outdir=${DATA_ROOT}/REVERIE/vgllm_after_backcausal/
 augdir=${DATA_ROOT}/REVERIE/annotations/REVERIE_aug_roberta_enc.json
 
 # 你的预训练模型路径
-reverie_pretrain_file=${DATA_ROOT}/REVERIE/pretrain/goat_reverie_pretrain_vgllmadd/ckpts/model_step_best.pt
+reverie_pretrain_file=${DATA_ROOT}/REVERIE/pretrain/goat_reverie_pretrain_vgllmadd_register/ckpts/model_step_best.pt
 
 flag="--root_dir ${DATA_ROOT}
       --dataset reverie

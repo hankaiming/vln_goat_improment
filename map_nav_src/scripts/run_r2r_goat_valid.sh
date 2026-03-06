@@ -1,17 +1,15 @@
 name=goat_r2r_valid
-
+export NLTK_DATA="/workspace/VLN-GOAT/nltk_data"
 DATA_ROOT=../datasets
 train_alg=dagger
 ft_dim=768
 features=clip768
 ngpus=1
 seed=0
-
 outdir=${DATA_ROOT}/R2R/
 backdoor_dict_file=${DATA_ROOT}/R2R/navigator/goat_r2r/logs/backdoor/backdoor_update_features.tsv
 frontdoor_dict_file=${DATA_ROOT}/R2R/navigator/goat_r2r/logs/frontdoor/frontdoor_update_features.tsv
-resume_file=${DATA_ROOT}/R2R/navigator/goat_r2r/ckpts/best_val_unseen.pt
-
+resume_file=${DATA_ROOT}/R2R/pretrain/goat_r2r_pretrain_vgllm_register/ckpts/model_step_best.pt
 flag="--root_dir ${DATA_ROOT}
       --dataset r2r
       --output_dir ${outdir}

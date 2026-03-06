@@ -88,12 +88,14 @@ class GMapNavAgent(Seq2SeqAgent):
         batch_view_img_fts, batch_loc_fts, batch_nav_types = [], [], []
         batch_view_lens = []
         batch_cand_vpids = []
+        batch_view_vggt_fts = []  # <--- [新增] 记录 batch vggt特征
         
         z_img_features, z_img_pzs = None, None
         batch_size = len(obs)
         
         for i, ob in enumerate(obs):
             view_img_fts, view_ang_fts, nav_types, cand_vpids = [], [], [], []
+            view_vggt_fts = []  # <--- [新增]
             obj_nav_types = []
             # cand views
             used_viewidxs = set()
@@ -107,6 +109,11 @@ class GMapNavAgent(Seq2SeqAgent):
                 nav_types.append(1)
                 cand_vpids.append(cc['viewpointId'])
                 used_viewidxs.add(cc['pointId'])
+                
+                # <--- [新增] 取出候选图的VGGT特征
+                if ob.get('view_vggt_fts') is not None:
+                    view_vggt_fts.append(ob['view_vggt_fts'][cc['pointId']])
+                    
             # non cand views
             if noise is None:
                 view_img_fts.extend([x[:self.args.image_feat_size] for k, x \
@@ -117,11 +124,21 @@ class GMapNavAgent(Seq2SeqAgent):
             view_ang_fts.extend([x[self.args.image_feat_size:] for k, x \
                 in enumerate(ob['feature']) if k not in used_viewidxs])
             nav_types.extend([0] * (36 - len(used_viewidxs)))
+            
+            # <--- [新增] 取出非候选图的VGGT特征
+            if ob.get('view_vggt_fts') is not None:
+                view_vggt_fts.extend([ob['view_vggt_fts'][k] for k in range(36) if k not in used_viewidxs])
+
             # combine cand views and noncand views
             view_img_fts = np.stack(view_img_fts, 0)    # (n_views, dim_ft)
             view_ang_fts = np.stack(view_ang_fts, 0)
             view_box_fts = np.array([[1, 1, 1]] * len(view_img_fts)).astype(np.float32)
             view_loc_fts = np.concatenate([view_ang_fts,view_box_fts], 1)
+            
+            # <--- [新增] 汇总 VGGT 特征
+            if len(view_vggt_fts) > 0:
+                view_vggt_fts = np.stack(view_vggt_fts, 0)
+                batch_view_vggt_fts.append(torch.from_numpy(view_vggt_fts))
             
             batch_view_img_fts.append(torch.from_numpy(view_img_fts))
             batch_loc_fts.append(torch.from_numpy(view_loc_fts))
@@ -135,6 +152,12 @@ class GMapNavAgent(Seq2SeqAgent):
         batch_nav_types = pad_sequence(batch_nav_types, batch_first=True, padding_value=0).cuda()
         batch_view_lens = torch.LongTensor(batch_view_lens).cuda()
         
+        # <--- [新增] pad VGGT Tensor
+        if len(batch_view_vggt_fts) > 0:
+            batch_view_vggt_fts = pad_tensors(batch_view_vggt_fts).cuda()
+        else:
+            batch_view_vggt_fts = None
+        
         if img_zdict is not None:
             z_img_features = img_zdict['img_features'].repeat(batch_size,1).reshape(batch_size,-1,768)
             z_img_pzs = img_zdict['img_pzs'].repeat(batch_size,1).reshape(batch_size,-1,1)
@@ -144,6 +167,7 @@ class GMapNavAgent(Seq2SeqAgent):
             'view_img_fts': batch_view_img_fts, 'loc_fts': batch_loc_fts, 
             'nav_types': batch_nav_types,'view_lens': batch_view_lens, 
             'cand_vpids': batch_cand_vpids,
+            'view_vggt_fts': batch_view_vggt_fts, # <--- [新] 暴露给下游网络
             'z_img_features': z_img_features, 'z_img_pzs': z_img_pzs,
             'already_dropout': already_dropout
         }
@@ -153,6 +177,7 @@ class GMapNavAgent(Seq2SeqAgent):
         batch_size = len(obs)
         
         batch_gmap_vpids, batch_gmap_lens = [], []
+        # ====== FIX: list size should match 3 variables on the left ====== 
         batch_gmap_img_embeds, batch_gmap_step_ids, batch_gmap_pos_fts = [], [], []
         batch_gmap_pair_dists, batch_gmap_visited_masks = [], []
         batch_no_vp_left = []
@@ -368,7 +393,7 @@ class GMapNavAgent(Seq2SeqAgent):
                 heading = (viewidx % 12) * math.radians(30)
                 elevation = (viewidx // 12 - 1) * math.radians(30)
             else:
-                state = self.env.env.sims.getState()[i]
+                state = self.env.env.sims[i].getState()[0]
                 action = state.location.viewpointId
                 heading = state.heading
                 elevation = state.elevation
@@ -377,7 +402,8 @@ class GMapNavAgent(Seq2SeqAgent):
             headings.append(heading)
             elevations.append(elevation)
         
-        self.env.env.sims.newEpisode(scans, actions, headings, elevations)
+        # ====== FIX: Call newEpisodes on the EnvBatch instance ====== 
+        self.env.env.newEpisodes(scans, actions, headings)
 
     def _update_scanvp_cands(self, obs):
         for ob in obs:
@@ -888,16 +914,21 @@ class GMapNavAgent(Seq2SeqAgent):
             gt_path = gt_path[:self.args.max_action_len] + [end_vp]
         
         traj_view_img_fts, traj_loc_fts, traj_nav_types, traj_cand_vpids = [], [], [], []
+        traj_view_vggt_fts = [] # <--- [新增]
 
         for vp in gt_path:
             view_fts = self.env.env.feat_db.get_image_feature(scan, vp)
+            view_vggt_fts_raw = self.env.env.vggt_db.get_image_feature(scan, vp) if self.env.env.vggt_db is not None else None
             view_img_fts, view_angles, cand_vpids = [], [], []
+            view_vggt_fts = [] # <--- [新增]
             # cand views
             nav_cands = self.env.scanvp_cands['%s_%s'%(scan, vp)]
             used_viewidxs = set()
             for k, v in nav_cands.items():
                 used_viewidxs.add(v[0])
                 view_img_fts.append(view_fts[v[0]])
+                if view_vggt_fts_raw is not None:  # <--- [新增]
+                    view_vggt_fts.append(view_vggt_fts_raw[v[0]])
                 view_angle = self.env.all_point_rel_angles[12][v[0]]
                 heading = cur_heading - view_angle[0] + v[2]
                 elevation = cur_elevation - view_angle[1] + v[3]
@@ -905,16 +936,22 @@ class GMapNavAgent(Seq2SeqAgent):
                 cand_vpids.append(k)
 
             view_img_fts.extend([view_fts[idx] for idx in range(36) if idx not in used_viewidxs])
+            if view_vggt_fts_raw is not None:  # <--- [新增]
+                view_vggt_fts.extend([view_vggt_fts_raw[idx] for idx in range(36) if idx not in used_viewidxs])
             view_angles.extend([self.env.all_point_rel_angles[12][idx] for idx in range(36) if idx not in used_viewidxs])
     
             # combine cand views and noncand views
             view_img_fts = np.stack(view_img_fts, 0)    # (n_views, dim_ft)
+            if view_vggt_fts_raw is not None:  # <--- [新增]
+                view_vggt_fts = np.stack(view_vggt_fts, 0)
             view_angles = np.stack(view_angles, 0)
             view_ang_fts = get_angle_fts(view_angles[:, 0], view_angles[:, 1], self.env.angle_feat_size)
             view_box_fts = np.array([[1, 1, 1]] * len(view_img_fts)).astype(np.float32)
             
             # combine pano features
             traj_view_img_fts.append(view_img_fts)
+            if view_vggt_fts_raw is not None:  # <--- [新增]
+                traj_view_vggt_fts.append(view_vggt_fts)
             traj_loc_fts.append(np.concatenate([view_ang_fts, view_box_fts], 1))
             traj_nav_types.append([1] * len(cand_vpids) + [0] * (36 - len(used_viewidxs)))
 
@@ -934,6 +971,7 @@ class GMapNavAgent(Seq2SeqAgent):
             'txt_ids': torch.LongTensor(item['instr_encoding'][:self.args.max_instr_len]),
             
             'traj_view_img_fts': [torch.from_numpy(x[:, :self.args.image_feat_size]) for x in traj_view_img_fts],
+            'traj_view_vggt_fts': [torch.from_numpy(x) for x in traj_view_vggt_fts] if len(traj_view_vggt_fts) > 0 else None, # <--- [新增]
             'traj_loc_fts': [torch.from_numpy(x) for x in traj_loc_fts],
             'traj_reverie_loc_fts': None,
             'traj_nav_types': [torch.LongTensor(x) for x in traj_nav_types],
@@ -972,6 +1010,11 @@ class GMapNavAgent(Seq2SeqAgent):
             sum([[len(y) for y in x] for x in batch['traj_view_img_fts']], [])
         )
         batch['traj_view_img_fts'] = pad_tensors(sum(batch['traj_view_img_fts'], []))
+        if batch.get('traj_view_vggt_fts') is not None and batch['traj_view_vggt_fts'][0] is not None: # <--- [新增]
+            batch['traj_view_vggt_fts'] = pad_tensors(sum(batch['traj_view_vggt_fts'], []))
+        else:
+            batch['traj_view_vggt_fts'] = None
+            
         if 'traj_obj_img_fts' in batch:
             batch['traj_vp_obj_lens'] = torch.LongTensor(
                 sum([[len(y) for y in x] for x in batch['traj_obj_img_fts']], [])

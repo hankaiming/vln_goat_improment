@@ -27,7 +27,7 @@ class EnvBatch(object):
     ''' A simple wrapper for a batch of MatterSim environments,
         using discretized viewpoints and pretrained features '''
 
-    def __init__(self, args, connectivity_dir, scan_data_dir=None, feat_db=None, batch_size=100):
+    def __init__(self, args, connectivity_dir, scan_data_dir=None, feat_db=None, vggt_db=None, batch_size=100):
         """
         1. Load pretrained image feature
         2. Init the Simulator.
@@ -35,6 +35,7 @@ class EnvBatch(object):
         :param batch_size:  Used to create the simulator list.
         """
         self.args = args
+        self.vggt_db = vggt_db
         self.aug_feat_db = None
         if type(feat_db) is list:
             self.aug_feat_db = feat_db
@@ -84,7 +85,11 @@ class EnvBatch(object):
             else:
                 feature = self.feat_db.get_image_feature(state.scanId, state.location.viewpointId, self.args.img_type)
                 
-            feature_states.append((feature, state))
+            vggt_ft = None
+            if self.vggt_db is not None:
+                vggt_ft = self.vggt_db.get_image_feature(state.scanId, state.location.viewpointId)
+
+            feature_states.append((feature, vggt_ft, state))
         return feature_states
 
     def makeActions(self, actions):
@@ -100,10 +105,11 @@ class R2RNavBatch(object):
     def __init__(
         self, view_db, instr_data, connectivity_dir, 
         batch_size=64, angle_feat_size=4, seed=0, name=None, sel_data_idxs=None,
-        speaker_angle_feat_size=128,tok=None,args=None, scanvp_cands_file=None, save_instr=False
+        speaker_angle_feat_size=128,tok=None,args=None, scanvp_cands_file=None, save_instr=False,
+        vggt_db=None
         
     ):
-        self.env = EnvBatch(args, connectivity_dir, feat_db=view_db, batch_size=batch_size)
+        self.env = EnvBatch(args, connectivity_dir, feat_db=view_db, vggt_db=vggt_db, batch_size=batch_size)
         self.args = args
         self.data = instr_data
         self.scans = set([x['scan'] for x in self.data])
@@ -335,7 +341,7 @@ class R2RNavBatch(object):
 
     def _get_obs(self):
         obs = []
-        for i, (feature, state) in enumerate(self.env.getStates()):
+        for i, (feature, vggt_ft, state) in enumerate(self.env.getStates()):
             item = self.batch[i]
             base_view_id = state.viewIndex
 
@@ -354,6 +360,7 @@ class R2RNavBatch(object):
                 'elevation' : state.elevation,
                 'feature' : agent_feature,
                 'candidate': candidate,
+                'view_vggt_fts': vggt_ft,
                 'navigableLocations' : state.navigableLocations,
                 'instruction' : item['instruction'],
                 'instr_encoding': item['instr_encoding'],
@@ -518,4 +525,3 @@ class R2RNavBatch(object):
             'CLS': np.mean(metrics['CLS']) * 100,
         }
         return avg_metrics, metrics
-        

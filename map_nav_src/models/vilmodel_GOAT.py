@@ -365,7 +365,7 @@ class CausalImageEmbeddings(nn.Module):
             nn.Linear(config.hidden_size, config.hidden_size),
             BertLayerNorm(config.hidden_size, eps=1e-12)
         )
-        self.vggt_pool_dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.vggt_pool_dropout = nn.Dropout(0.5)
         # =====================================================================
 
         ''' For interventional image '''
@@ -901,12 +901,9 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
         img_masks = gen_seq_masks(view_lens)
         view_img_embeds = self.img_embeddings.img_layer_norm(self.img_embeddings.img_linear(view_img_fts))
 
-    # ================= [VGGT fusion] =================
-        if traj_view_vggt_fts is not None:
-            # Use the new attention-pool + proj + post-MLP fusion implemented in img_embeddings
-            view_img_embeds = self.img_embeddings._fuse_vggt_into_view(view_img_embeds, traj_view_vggt_fts)
-    # ================================================
-        
+        # ================================================================
+        # 1. 先进行因果干预 (在纯 CLIP 空间与字典对齐交互)
+        # ================================================================
         if z_img_features is not None:
             # Do intervention
             if self.config.do_back_img_type == 'type_1':
@@ -933,9 +930,18 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
 
                 view_img_embeds = self.img_embeddings.do_img_concat_layernorm(view_img_embeds)
         
+        # ================================================================
+        # 2. 在干预完成后，再融合 VGGT 特征 (特征增强)
+        # ================================================================
+        if traj_view_vggt_fts is not None:
+            # Use the new attention-pool + proj + post-MLP fusion implemented in img_embeddings
+            view_img_embeds = self.img_embeddings._fuse_vggt_into_view(view_img_embeds, traj_view_vggt_fts)
+        # ================================================================
+        
         img_masks = gen_seq_masks(view_lens)
         extended_img_masks = extend_neg_masks(img_masks)
         
+        # 3. 注入位置编码并进入 Self-Encoder
         if self.config.name not in ['REVERIE', 'SOON']:
             view_img_embeds = view_img_embeds +\
                             self.img_embeddings.loc_layer_norm(self.img_embeddings.loc_linear(loc_fts))
@@ -987,7 +993,7 @@ class GlocalTextPathNavCMT(BertPreTrainedModel):
             return view_img_embeds, img_masks, traj_fused_embeds
         else:
             return view_img_embeds, img_masks, None
-
+        
     def forward_navigation_per_step(
         self, txt_embeds, txt_masks, gmap_img_embeds, gmap_step_ids, gmap_pos_fts, 
         gmap_masks, gmap_pair_dists, gmap_visited_masks, gmap_vpids,

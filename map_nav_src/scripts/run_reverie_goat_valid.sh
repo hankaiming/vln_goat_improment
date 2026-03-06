@@ -1,4 +1,4 @@
-name=goat_reverie_valid
+name=goat_reverie_valid_register1
 DATA_ROOT=../datasets
 export NLTK_DATA="/workspace/VLN-GOAT/nltk_data"
 train_alg=dagger
@@ -10,9 +10,13 @@ ngpus=1
 seed=0
 
 outdir=${DATA_ROOT}/REVERIE/
-backdoor_dict_file=${DATA_ROOT}/REVERIE/navigator/goat_reverie/logs/backdoor/backdoor_update_features.tsv
-frontdoor_dict_file=${DATA_ROOT}/REVERIE/navigator/goat_reverie/logs/frontdoor/frontdoor_update_features.tsv
-resume_file=${DATA_ROOT}/REVERIE/vgllm/navigator/goat_reverie/ckpts/best_val_unseen.pt
+
+
+backdoor_dict_file=${DATA_ROOT}/REVERIE/vgllm_add_register7w/navigator/goat_reverie/logs/backdoor/backdoor_update_features.tsv
+frontdoor_dict_file=${DATA_ROOT}/REVERIE/vgllm_add_register7w/navigator/goat_reverie/logs/frontdoor/frontdoor_update_features.tsv
+resume_file=${DATA_ROOT}/REVERIE/vgllm_add_register7w/navigator/goat_reverie/ckpts/best_val_unseen.pt
+
+
 flag="--root_dir ${DATA_ROOT}
       --dataset reverie
       --output_dir ${outdir}
