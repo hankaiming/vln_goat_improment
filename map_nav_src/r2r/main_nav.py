@@ -22,6 +22,7 @@ from utils.data import ImageFeaturesDB, Tokenizer, KMeansPicker
 from r2r.transpeaker import Speaker
 from r2r.data_utils import construct_instrs
 from r2r.env import R2RNavBatch
+from r2r.env import SceneCaptionDB  # <--- [新增] 导入 SceneCaptionDB
 from r2r.parser import parse_args
 
 from r2r.agent import GMapNavAgent
@@ -66,13 +67,24 @@ def build_dataset(args, rank=0):
     feat_db = ImageFeaturesDB(args.img_ft_file, args.image_feat_size)
 
     vggt_db = None
-    vggt_path = "/workspace/VLN-DUET/data/vggt_features_REGIERS.h5"  # 你的路径
-    if os.path.exists(vggt_path):
-        print(f"Loading VGGT features from {vggt_path}...")
-        vggt_db = VGGTFeaturesDB(vggt_path)
-    else:
-        print(f"Warning: VGGT file not found at {vggt_path}")
+    # vggt_path = "/workspace/VLN-DUET/data/vggt_features_REGIERS.h5"  # 你的路径
+    # if os.path.exists(vggt_path):
+    #     print(f"Loading VGGT features from {vggt_path}...")
+    #     vggt_db = VGGTFeaturesDB(vggt_path)
+    # else:
+    #     print(f"Warning: VGGT file not found at {vggt_path}")
     
+    # <--- [新增] 加载 Scene Caption 数据
+    scene_caption_db = None
+    # 建议将 caption_path 作为参数传入 args.caption_path，这里暂时硬编码方便你测试
+    caption_path = getattr(args, 'caption_path', '/workspace/VLN-DUET/data/vln_image_captions_roberta.json') 
+    if os.path.exists(caption_path):
+        print(f"Loading Scene Captions from {caption_path}...")
+        scene_caption_db = SceneCaptionDB(caption_path)
+    else:
+        print(f"Warning: Scene Caption file not found at {caption_path}")
+    # =====================================
+
     # Use augmented features
     if args.use_aug_env:
         train_feat_db = [feat_db]
@@ -100,7 +112,8 @@ def build_dataset(args, rank=0):
             batch_size=args.batch_size, angle_feat_size=args.angle_feat_size, 
             seed=args.seed+rank, sel_data_idxs=None, name='aug', 
             args=args, scanvp_cands_file=args.scanvp_cands_file,
-            vggt_db=vggt_db  # <--- [新增] 传入 vggt_db
+            vggt_db=vggt_db,
+            scene_caption_db=scene_caption_db  # <--- [新增] 传入 scene_caption_db
         )
     else:
         aug_env = None
@@ -117,7 +130,8 @@ def build_dataset(args, rank=0):
         angle_feat_size=args.angle_feat_size, seed=args.seed+rank,
         sel_data_idxs=None, name='train', 
         args=args, scanvp_cands_file=args.scanvp_cands_file,
-        vggt_db=vggt_db  # <--- [新增] 传入 vggt_db
+        vggt_db=vggt_db,
+        scene_caption_db=scene_caption_db  # <--- [新增] 传入 scene_caption_db
     )
 
     val_env_names = ['val_train_seen', 'val_seen', 'val_unseen']
@@ -141,7 +155,8 @@ def build_dataset(args, rank=0):
             angle_feat_size=args.angle_feat_size, seed=args.seed+rank,
             sel_data_idxs=None if args.world_size < 2 else (rank, args.world_size), name=split,
             args=args, scanvp_cands_file=args.scanvp_cands_file,
-            vggt_db=vggt_db  # <--- [新增] 传入 vggt_db
+            vggt_db=vggt_db,
+            scene_caption_db=scene_caption_db  # <--- [新增] 传入 scene_caption_db
         )  
         val_envs[split] = val_env
 
@@ -171,7 +186,7 @@ def train(args, train_env, val_envs, aug_env=None, rank=-1, bert_tok=None, speak
                 record_file
             )
         # start_iter = 0
-       
+        
     # first evaluation
     if args.eval_first:
         loss_str = "validation before training"

@@ -173,59 +173,60 @@ class VGGTFeaturesDB(object):
         self._feature_store[key] = ft
         return ft
 
-# [新增] 读取 Scene Caption (针对你的 JSON 格式)
 class SceneCaptionDB(object):
     def __init__(self, caption_file):
         self.caption_file = caption_file
-        self._feature_store = {}
+        self._feature_store_ids = {}
+        self._feature_store_masks = {}
         
         print(f"Loading Scene Caption from {self.caption_file}...")
         
-        # 临时存储：用来把 36 个 view 的一维数组拼成一个 [36, 30] 的二维数组
-        temp_store = defaultdict(lambda: np.zeros((36, 30), dtype=np.int64))
+        # 临时存储：ids 用 1 初始化 (RoBERTa pad_token_id=1)
+        # masks 用 0 初始化 (0 表示 padding，不参与 attention)
+        temp_store_ids = defaultdict(lambda: np.ones((36, 30), dtype=np.int64))
+        temp_store_masks = defaultdict(lambda: np.zeros((36, 30), dtype=np.int64))
         
         with open(self.caption_file, 'r', encoding='utf-8') as f:
             data = json.load(f)
             
             for path_key, content in data.items():
-                # path_key: "17DRP5sb8fy/00ebbf3782c64d74aaf7dd39cd561175/view_00.jpg"
                 parts = path_key.split('/')
-                if len(parts) != 3:
-                    continue
+                if len(parts) != 3: continue
                 
                 scan = parts[0]
                 viewpoint = parts[1]
-                # 提取 view 的索引，例如 "view_00.jpg" -> 0, "view_13.jpg" -> 13
                 view_str = parts[2].replace('view_', '').replace('.jpg', '')
                 try:
                     view_idx = int(view_str)
                 except ValueError:
                     continue
                 
-                # 组合成在环境中查找的统一键名
                 unified_key = f"{scan}_{viewpoint}"
                 
-                # 提取 roberta_encoding 列表 (长度通常为 30)
+                # 提取 IDs 和 Masks
                 encoding = content.get('roberta_encoding', [])
+                mask = content.get('attention_mask', [])
+                
                 if len(encoding) > 0:
-                    # 将该视角的编码赋值到对应的行
-                    temp_store[unified_key][view_idx, :len(encoding)] = np.array(encoding, dtype=np.int64)
+                    temp_store_ids[unified_key][view_idx, :len(encoding)] = np.array(encoding, dtype=np.int64)
+                if len(mask) > 0:
+                    temp_store_masks[unified_key][view_idx, :len(mask)] = np.array(mask, dtype=np.int64)
 
         # 整理完毕，转存入正式的 store
-        self._feature_store = dict(temp_store)
-        print(f"Loaded Scene Captions for {len(self._feature_store)} viewpoints.")
+        self._feature_store_ids = dict(temp_store_ids)
+        self._feature_store_masks = dict(temp_store_masks)
+        print(f"Loaded Scene Captions for {len(self._feature_store_ids)} viewpoints.")
 
     def get_image_feature(self, scan, viewpoint):
         """
-        为了和 feat_db 接口统一，方法名保留为 get_image_feature
-        返回: shape 为 (36, 30) 的 numpy array (dtype=np.int64)
+        返回: (ids, masks)，两者 shape 均为 (36, 30)
         """
         key = f"{scan}_{viewpoint}"
-        if key in self._feature_store:
-            return self._feature_store[key]
+        if key in self._feature_store_ids:
+            return self._feature_store_ids[key], self._feature_store_masks[key]
         else:
-            # 如果没找到，返回全 0 的数组作为 Pad
-            return np.zeros((36, 30), dtype=np.int64)
+            # 没找到时，返回全 Pad
+            return np.ones((36, 30), dtype=np.int64), np.zeros((36, 30), dtype=np.int64)
 
 def load_nav_graphs(connectivity_dir, scans):
     ''' Load connectivity graph for each scan '''
