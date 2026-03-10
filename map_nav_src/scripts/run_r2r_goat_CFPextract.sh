@@ -7,9 +7,9 @@ features=clip768
 ngpus=1
 seed=0
 
-outdir=${DATA_ROOT}/R2R/vgllm_add_register/
+outdir=${DATA_ROOT}/R2R/test/image_captioning/
 augdir=${DATA_ROOT}/R2R/annotations/prevalent_aug_train_enc.json
-r2r_pretrain_file=${DATA_ROOT}/R2R/pretrain/goat_r2r_pretrain_vgllm_register/ckpts/model_step_best.pt
+r2r_pretrain_file=${DATA_ROOT}/R2R/pretrain/goat_r2r_pretrain_image_cationing/ckpts/model_step_best.pt
 flag="--root_dir ${DATA_ROOT}
       --dataset r2r
       --output_dir ${outdir}

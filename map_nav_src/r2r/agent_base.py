@@ -352,6 +352,6 @@ class Seq2SeqAgent(BaseAgent):
         for param in all_tuple:
             recover_state(*param)
 
-        return states['vln_bert'].get('epoch', 0) - 1
+        return states['vln_bert'].get('epoch', 0) 
 
 

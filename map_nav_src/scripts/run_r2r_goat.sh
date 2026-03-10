@@ -5,7 +5,7 @@ export NLTK_DATA="/workspace/VLN-GOAT/nltk_data"
 # ==================== [路径配置] ====================
 # 1. 预训练模型路径 (Pre-training 产出的 best_model.pt)
 # 请务必确认这个路径和你上一步提取特征时用的一样
-r2r_pretrain_file=${DATA_ROOT}/R2R/pretrain/goat_r2r_pretrain_vgllm_register/ckpts/model_step_best.pt
+r2r_pretrain_file=${DATA_ROOT}/R2R/pretrain/goat_r2r_pretrain_image_cationing/ckpts/model_step_best.pt
 # 2. CFP 特征文件路径 (你刚刚训练出来的，如果R2R不需要可以注释掉flag里的--front_feat_file)
 # 直接填你提供的路径 (如无指定可留空)
 cfp_features_file=
@@ -17,7 +17,7 @@ ft_dim=768
 ngpus=1
 seed=0
 
-outdir=${DATA_ROOT}/R2R/fintune/vggllm_register_add/
+outdir=${DATA_ROOT}/R2R/fintune/image_captioning_addpretrain/
 aug_file=${DATA_ROOT}/R2R/annotations/prevalent_aug_train_enc.json
 speaker_file=${DATA_ROOT}/R2R/speaker/transpeaker_r2r/state_dict/best_both_bleu.pt
 
@@ -44,7 +44,7 @@ flag="--root_dir ${DATA_ROOT}
       --max_action_len 15
       --max_instr_len 200
 
-      --batch_size 6
+      --batch_size 9
       --lr 2e-5
       --iters 150000
       --log_every 1000
@@ -82,5 +82,5 @@ flag="--root_dir ${DATA_ROOT}
 # 2. 删除了 --bert_ckpt_file 以避免 IsADirectoryError 报错
 # 3. 脚本 flag 中已经加入了 --front_feat_file 来读取 CFP 特征
 CUDA_VISIBLE_DEVICES='0' python -u r2r/main_nav.py $flag \
-      --resume_file ${r2r_pretrain_file}
+      --bert_ckpt_file ${r2r_pretrain_file}
 # ====================================================

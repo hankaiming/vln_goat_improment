@@ -10,7 +10,6 @@ from collections import defaultdict
 import copy
 
 import MatterSim
-import random
 
 from utils.data import load_nav_graphs, new_simulator
 from utils.data import angle_feature, get_all_point_angle_feature, get_view_rel_angles
@@ -22,6 +21,67 @@ ERROR_MARGIN = 3.0
 MAX_DIST = 30   # normalize
 MAX_STEP = 10   # normalize
 TRAIN_MAX_STEP = 20
+
+# ==========================================================
+# [新增] 读取 Scene Caption (支持 RoBERTa padding 和 Attention Mask)
+# ==========================================================
+class SceneCaptionDB(object):
+    def __init__(self, caption_file):
+        self.caption_file = caption_file
+        self._feature_store_ids = {}
+        self._feature_store_masks = {}
+        
+        print(f"Loading Scene Caption from {self.caption_file}...")
+        
+        # 临时存储：ids 用 1 初始化 (RoBERTa pad_token_id=1)
+        # masks 用 0 初始化 (0 表示 padding，不参与 attention)
+        temp_store_ids = defaultdict(lambda: np.ones((36, 30), dtype=np.int64))
+        temp_store_masks = defaultdict(lambda: np.zeros((36, 30), dtype=np.int64))
+        
+        with open(self.caption_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            
+            for path_key, content in data.items():
+                parts = path_key.split('/')
+                if len(parts) != 3:
+                    continue
+                
+                scan = parts[0]
+                viewpoint = parts[1]
+                view_str = parts[2].replace('view_', '').replace('.jpg', '')
+                try:
+                    view_idx = int(view_str)
+                except ValueError:
+                    continue
+                
+                unified_key = f"{scan}_{viewpoint}"
+                
+                # 提取 IDs 和 Masks
+                encoding = content.get('roberta_encoding', [])
+                mask = content.get('attention_mask', [])
+                
+                if len(encoding) > 0:
+                    temp_store_ids[unified_key][view_idx, :len(encoding)] = np.array(encoding, dtype=np.int64)
+                if len(mask) > 0:
+                    temp_store_masks[unified_key][view_idx, :len(mask)] = np.array(mask, dtype=np.int64)
+
+        # 整理完毕，转存入正式的 store
+        self._feature_store_ids = dict(temp_store_ids)
+        self._feature_store_masks = dict(temp_store_masks)
+        print(f"Loaded Scene Captions for {len(self._feature_store_ids)} viewpoints.")
+
+    def get_image_feature(self, scan, viewpoint):
+        """
+        返回: (ids, masks)，两者 shape 均为 (36, 30)
+        """
+        key = f"{scan}_{viewpoint}"
+        if key in self._feature_store_ids:
+            return self._feature_store_ids[key], self._feature_store_masks[key]
+        else:
+            # 如果没找到，返回全 Pad
+            return np.ones((36, 30), dtype=np.int64), np.zeros((36, 30), dtype=np.int64)
+# ==========================================================
+
 
 class EnvBatch(object):
     ''' A simple wrapper for a batch of MatterSim environments,
@@ -89,8 +149,13 @@ class EnvBatch(object):
             vggt_ft = None
             if self.vggt_db is not None:
                 vggt_ft = self.vggt_db.get_image_feature(state.scanId, state.location.viewpointId)
+            
+            scene_caption_ids = None
+            scene_caption_masks = None
+            if self.scene_caption_db is not None:
+                scene_caption_ids, scene_caption_masks = self.scene_caption_db.get_image_feature(state.scanId, state.location.viewpointId)
 
-            feature_states.append((feature, vggt_ft, state))
+            feature_states.append((feature, vggt_ft, scene_caption_ids, scene_caption_masks, state))
         return feature_states
 
     def makeActions(self, actions):
@@ -107,10 +172,10 @@ class R2RNavBatch(object):
         self, view_db, instr_data, connectivity_dir, 
         batch_size=64, angle_feat_size=4, seed=0, name=None, sel_data_idxs=None,
         speaker_angle_feat_size=128,tok=None,args=None, scanvp_cands_file=None, save_instr=False,
-        vggt_db=None
+        vggt_db=None, scene_caption_db=None # <--- [新增]
         
     ):
-        self.env = EnvBatch(args, connectivity_dir, feat_db=view_db, vggt_db=vggt_db, batch_size=batch_size)
+        self.env = EnvBatch(args, connectivity_dir, feat_db=view_db, vggt_db=vggt_db, scene_caption_db=scene_caption_db, batch_size=batch_size)
         self.args = args
         self.data = instr_data
         self.scans = set([x['scan'] for x in self.data])
@@ -342,7 +407,7 @@ class R2RNavBatch(object):
 
     def _get_obs(self):
         obs = []
-        for i, (feature, vggt_ft, state) in enumerate(self.env.getStates()):
+        for i, (feature, vggt_ft, scene_caption_ids, scene_caption_masks, state) in enumerate(self.env.getStates()):
             item = self.batch[i]
             base_view_id = state.viewIndex
 
@@ -362,6 +427,8 @@ class R2RNavBatch(object):
                 'feature' : agent_feature,
                 'candidate': candidate,
                 'view_vggt_fts': vggt_ft,
+                'view_scene_caption_ids': scene_caption_ids,       # <--- [新增] 
+                'view_scene_caption_masks': scene_caption_masks,   # <--- [新增] 
                 'navigableLocations' : state.navigableLocations,
                 'instruction' : item['instruction'],
                 'instr_encoding': item['instr_encoding'],

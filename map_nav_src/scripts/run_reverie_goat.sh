@@ -20,7 +20,7 @@ obj_ft_dim=768
 ngpus=1
 seed=0
 
-outdir=${DATA_ROOT}/REVERIE/vgllm_add_register20w_hasvggtfeature_after_backcausal/
+outdir=${DATA_ROOT}/REVERIE/after_backcausal_imagecaption/
 aug_file=${DATA_ROOT}/REVERIE/annotations/REVERIE_train_aug_roberta_enc.json
 speaker_file=${DATA_ROOT}/REVERIE/speaker/transpeaker_reverie/ckpts/best_both_bleu.pt
 
